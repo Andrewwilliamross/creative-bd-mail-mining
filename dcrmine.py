@@ -6,7 +6,7 @@ Mail safety: every IMAP command passes a wire-level allow-list (CAPABILITY LOGIN
 folders are opened with EXAMINE only; FETCH may only use BODY.PEEK / BODYSTRUCTURE / headers / sizes / dates / flags.
 Secrets: password only from env (default ICLOUD_APP_PASSWORD); never printed or stored.  All dates are written in UTC."""
 import argparse, base64, codecs, collections, csv, datetime as dt, email, email.utils, hashlib, imaplib, json, os, quopri
-import re, socket, sqlite3, ssl, sys, time, unicodedata
+import pathlib, re, socket, sqlite3, ssl, sys, time, unicodedata
 from email.header import decode_header, make_header
 from html.parser import HTMLParser
 try: import fcntl
@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS survey_cache(k TEXT PRIMARY KEY, v TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS crawl_skips(folder TEXT, uid INTEGER, uidvalidity INTEGER, tries INTEGER, why TEXT, ts REAL, PRIMARY KEY(folder,uid));
 CREATE INDEX IF NOT EXISTS ix_msg_folder ON messages(folder, uid); CREATE INDEX IF NOT EXISTS ix_msg_decision ON messages(decision);
 CREATE INDEX IF NOT EXISTS ix_sigs_addr ON sigs(addr);
+CREATE TABLE IF NOT EXISTS decisions(kind TEXT, key TEXT, decision TEXT, role TEXT, note TEXT, evidence TEXT, ts INTEGER, PRIMARY KEY(kind, key));
+CREATE TABLE IF NOT EXISTS bounces(mid INTEGER, addr TEXT, ts INTEGER, hard INTEGER, status TEXT, reason TEXT, orig_subject TEXT, how TEXT, PRIMARY KEY(mid, addr));
 """
 MIGRATIONS = [("folders", "is_junk", "INTEGER DEFAULT 0"), ("folders", "crit", "TEXT"), ("contacts", "kind", "TEXT DEFAULT 'person'")]
 def opendb(path):
@@ -55,6 +57,7 @@ class RunLock:
     """One writer at a time per database: re-running a stage while an old nohup copy is still alive must not corrupt progress."""
     def __init__(s, dbpath): s.path = os.path.abspath(dbpath) + ".lock"; s.fh = None
     def __enter__(s):
+        os.makedirs(os.path.dirname(s.path), exist_ok=True)      # fresh --db directory: the lock file is the first thing created
         if fcntl is None: return s
         s.fh = open(s.path, "a+")
         try: fcntl.flock(s.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -916,6 +919,7 @@ def self_set(db, a):
     for r in db.execute("select from_addr, count(*) n from messages where is_sent=1 group by from_addr having n>=2"): s.add(r[0])
     db.execute("update messages set is_sent=1 where from_addr in (%s)" % ",".join("?" * len(s)), tuple(s)) if s else None
     return s
+DSN_REASON = "delivery failure notice"   # filter marks bounce messages this way; fetch still stores their body so `bounces` can read the failed address
 def cmd_filter(a):
     db = opendb(a.db); stage(db, "filter", "running"); selfs = self_set(db, a); meta_set(db, "self", json.dumps(sorted(selfs)))
     junk_folders = {r["name"] for r in db.execute("select name, flags, display from folders") if is_junk_folder({"flags": r["flags"] or "", "display": r["display"] or r["name"]})}
@@ -969,7 +973,7 @@ def cmd_filter(a):
     for r in db.execute("select id,from_addr,subject,folder,has_att,att,bulk,msgid from messages where is_sent=0 and decision is null").fetchall():
         k, why = dec.get(r["from_addr"], ("keep", "no sender"))
         if re.match(r"(mailer-daemon|postmaster)", r["from_addr"]) and re.search(r"undeliver|delivery status|failure notice|returned mail|delivery failed|undelivered|could not be delivered", r["subject"] or "", re.I):
-            db.execute("update messages set decision='noise', dreason='delivery failure notice' where id=?", (r["id"],)); continue
+            db.execute("update messages set decision='noise', dreason=? where id=?", (DSN_REASON, r["id"])); continue
         junk = r["folder"] in junk_folders and not written.get(r["from_addr"])
         if junk: k, why = "noise", "junk/trash folder"
         elif k == "keep" and r["bulk"] and r["msgid"] not in sent_refs and r["from_addr"] not in ov and dom_of(r["from_addr"]) not in ov: k, why = "noise", "mailing-list/bulk message David did not reply to"
@@ -1071,13 +1075,13 @@ def fetch_bodies(db, c, rows, cap=60000, batch=50):
                     r, p_ = meta[u]; raw = got[u].get("sections", {}).get(path.upper(), b"") or b""
                     t = decode_part(raw, p_["enc"], p_["charset"], p_["type"], truncated=len(raw) >= cap); new, quoted = split_quote(t); body, sig = split_sig(new)
                     db.execute("insert or replace into bodies values(?,?,?,?,?)", (r["id"], body[:20000], quoted[:3000], sig[:1500], 1 if len(raw) >= cap else 0))
-                    ps = parse_sig(sig, r["from_addr"]) if not r["is_sent"] else None
+                    ps = parse_sig(sig, r["from_addr"]) if not r["is_sent"] and r["decision"] == "keep" else None
                     if ps and r["from_addr"]: db.execute("insert into sigs values(?,?,?,?,?,?,?,?)", (r["id"], r["from_addr"], ps["name"], ps["title"], ps["company"], ps["phone"], ps["site"], r["ts"]))
             db.commit()
         log(f"fetch: {folder} done")
 def body_candidates(db):
     """messages whose body we may fetch: survived the filter AND live in a folder the plan marks deep"""
-    rows = db.execute("select id,folder,uid,parts,from_addr,ts,decision,is_sent from messages where decision='keep' and id not in (select mid from bodies) order by folder, uid").fetchall()
+    rows = db.execute("select id,folder,uid,parts,from_addr,ts,decision,is_sent from messages where (decision='keep' or dreason=?) and id not in (select mid from bodies) order by folder, uid", (DSN_REASON,)).fetchall()
     act = {}
     def deep(f):
         if f not in act: act[f] = meta_get(db, "action:" + f, "deep") == "deep"
@@ -1085,7 +1089,10 @@ def body_candidates(db):
     return [r for r in rows if deep(r["folder"])]
 def cmd_fetch(a):
     db = opendb(a.db); need_survey(db); stage(db, "fetch", "running")
-    rows = body_candidates(db)
+    if a.ids:        # on demand: the text of specific messages the filter dropped or a headers-only folder skipped (BODY.PEEK, same read-only path)
+        want = [int(x) for x in re.split(r"[,\s]+", a.ids.strip()) if x]
+        rows = db.execute(f"select id,folder,uid,parts,from_addr,ts,decision,is_sent from messages where id in ({','.join('?' * len(want))}) and decision!='dup' and id not in (select mid from bodies) order by folder, uid", want).fetchall()
+    else: rows = body_candidates(db)
     log(f"fetch: {len(rows)} messages need bodies")
     if a.dry_run: print(f"[dry-run] would fetch {len(rows)} bodies (text parts only, capped at {a.max_body} bytes each)"); return
     if rows:
@@ -1274,14 +1281,243 @@ def cmd_projects(a):
     db.commit(); stage(db, "projects", "done", f"{len(groups)} projects"); print(f"projects: {len(groups)} (from {len(T)} work threads)")
 
 # ---------------------------------------------------------------- STAGE 7: exports (CRM-ready CSVs)
+# ---------------------------------------------------------------- BOT TOOLS: bounces, decisions, show, search (offline; they read the SQLite only, never the mailbox)
+DECISIONS = ("keep", "junk", "unsure", "do-not-contact")
+ROLES = ("buyer", "past-client", "collaborator", "vendor", "personal", "service", "noise", "other")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-']+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+")
+STATUS_RE = re.compile(r"\b([45])\.\d{1,3}\.\d{1,3}\b")
+FINAL_RCPT = re.compile(r"(?:final|original)-recipient:\s*(?:rfc822;)?\s*<?([^\s<>;]+@[^\s<>;]+)", re.I)
+BOUNCE_WHY = re.compile(r"(user unknown|unknown user|does not exist|doesn'?t exist|no such (user|mailbox|recipient)|mailbox (unavailable|not found|full|disabled)|recipient (address )?rejected|address (not found|rejected)|invalid (recipient|address)|unable to deliver|couldn'?t be found|not found|over quota|quota exceeded|blocked|account (disabled|inactive)|domain (not found|does not exist)|host or domain name not found)", re.I)
+DSN_ORIGINAL = re.compile(r"^[ \t>]*(-{2,}.*(original|forwarded|message).*|original message.*|reporting-mta:.*|received:.*|return-path:.*|message-id:.*|content-type:.*|(from|to|cc|subject|date):.*)$", re.I | re.M)
+DSN_PREFIX = re.compile(r"^\s*(undeliverable|undelivered mail returned to sender|returned mail|mail delivery failed|failure notice|delivery (status notification|failure)[^:]*)\s*[:\-]\s*", re.I)
+def parse_ymd(v, end=False):
+    """'2019' | '2019-06' | '2019-06-01' -> epoch seconds (UTC) at the start of that period"""
+    if not v: return None
+    m = re.match(r"^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?$", str(v).strip())
+    if not m: raise SystemExit(f"bad date {v!r}: use YYYY or YYYY-MM-DD")
+    return int(dt.datetime(int(m.group(1)), int(m.group(2) or 1), int(m.group(3) or 1), tzinfo=dt.timezone.utc).timestamp())
+def open_ro(path):
+    """read-only SQLite connection for show/search/decisions: cannot change the database or take the writer lock"""
+    if not os.path.exists(path): raise SystemExit(f"no database at {path}; run the mining stages first")
+    db = sqlite3.connect(pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro", uri=True, timeout=60); db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=60000"); db.create_function("fold", 1, lambda x: (x or "").casefold(), deterministic=True); return db
+def has_table(db, t): return bool(db.execute("select 1 from sqlite_master where type='table' and name=?", (t,)).fetchone())
+def stamp(ts): return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(ts)) if ts else "undated"
+
+def build_bounces(db):
+    """Addresses David wrote to that bounced. Exact: the failed recipient named in the delivery-failure message body (fetch stores DSN bodies).
+    Fallback when no body was fetched: 'Undeliverable: <subject>' matched to David's own sent mail within 3 days. Rebuilt from the DB each call."""
+    selfs = set(json.loads(meta_get(db, "self", "[]"))); sent = collections.defaultdict(list)
+    for r in db.execute("select m.ts, m.subject, a.addr from messages m join addrs a on a.mid=m.id and a.role in ('to','cc') where m.is_sent=1 and m.decision='keep'"): sent[r["addr"]].append((r["ts"] or 0, r["subject"] or ""))
+    db.execute("delete from bounces"); n = 0
+    for m in db.execute("select m.id, m.ts, m.subject, b.text from messages m left join bodies b on b.mid=m.id where m.dreason=?", (DSN_REASON,)).fetchall():
+        text = m["text"] or ""; subj = m["subject"] or ""; found = []; how = "failure notice body"
+        found = [x.lower().strip(".,'") for x in FINAL_RCPT.findall(text)]
+        if not found: found = [x.lower().strip(".,'") for x in EMAIL_RE.findall(DSN_ORIGINAL.split(text, 1)[0][:3000])]      # explanation only, not the quoted original (its To:/Cc: lines name people who got the mail fine)
+        found = [x for x in dict.fromkeys(found) if x in sent and x not in selfs]
+        if not found:
+            allx = [x for x in dict.fromkeys(y.lower().strip(".,'") for y in EMAIL_RE.findall(text)) if x in sent and x not in selfs]
+            found = allx if len(allx) == 1 else []
+        orig = DSN_PREFIX.sub("", subj).strip() if DSN_PREFIX.match(subj) else ""
+        if not found and orig:
+            nk = norm_subject(orig); near = [(m["ts"] - ts, ad) for ad, l in sent.items() if ad not in selfs for ts, sj in l if norm_subject(sj) == nk and m["ts"] and 0 <= m["ts"] - ts <= 3 * 86400]
+            if near: best = min(d for d, _ in near); found = sorted({ad for d, ad in near if d == best}); how = "matched to David's sent mail by subject"
+        st = STATUS_RE.search(text); status = st.group(0) if st else ""
+        if not status:
+            mm = re.search(r"\b([45]\d\d)[ -]\d", text); status = mm.group(1) if mm else ""
+        soft = bool(re.search(r"delay|warning|temporar|will keep trying|still trying", subj, re.I)) or status.startswith("4")
+        hard = 0 if soft else (1 if status.startswith("5") or re.search(r"permanent|failed|undeliverable|unknown", subj + " " + text[:600], re.I) else None)
+        why = BOUNCE_WHY.search(text); reason = ""
+        if why:
+            line = next((l.strip() for l in text.splitlines() if why.group(0).lower() in l.lower()), why.group(0)); reason = line[:160]
+        elif text.strip(): reason = next((l.strip() for l in text.splitlines() if l.strip()), "")[:160]
+        for ad in found:
+            db.execute("insert or replace into bounces values(?,?,?,?,?,?,?,?)", (m["id"], ad, m["ts"], hard, status, reason, orig, how)); n += 1
+    db.commit(); return n
+def bounce_rows(db):
+    """one row per bounced address, newest bounce first, with the evidence the bot needs to decide whether the address is really dead"""
+    con = {r["addr"]: r for r in db.execute("select * from contacts")}; byname = collections.defaultdict(set)
+    for ad, r in con.items():
+        k = name_key(r["name"] or "")
+        if k and len((r["name"] or "").split()) >= 2: byname[k].add(ad)
+    out = []
+    for ad, in db.execute("select addr from bounces group by addr order by max(ts) desc").fetchall():
+        bs = db.execute("select * from bounces where addr=? order by ts desc", (ad,)).fetchall(); b = bs[0]
+        last_to = db.execute("select max(m.ts) from messages m join addrs a on a.mid=m.id and a.role in ('to','cc') where m.is_sent=1 and m.decision='keep' and a.addr=?", (ad,)).fetchone()[0]
+        last_from = db.execute("select max(ts) from messages where is_sent=0 and decision='keep' and from_addr=?", (ad,)).fetchone()[0]
+        heard_after = bool(last_from and b["ts"] and last_from > b["ts"]); kind = "hard" if any(x["hard"] == 1 for x in bs) else ("soft" if all(x["hard"] == 0 for x in bs) else "unknown")
+        c = con.get(ad); others = sorted(byname[name_key(c["name"] or "")] - {ad}) if c and name_key(c["name"] or "") in byname else []
+        if heard_after: step = "they wrote to David after the bounce, so the address may still work; check before treating it as dead"
+        elif kind == "soft": step = "temporary failure; retry later, no lookup needed unless it repeats"
+        else: step = "current-address lookup needed (do not use this address for outreach until then)"
+        out.append({"addr": ad, "name": c["name"] if c else "", "company": c["company"] if c else "", "ts": b["ts"], "n": len(bs), "kind": kind, "status": b["status"], "reason": b["reason"], "orig": b["orig_subject"], "how": b["how"],
+                    "last_to": last_to, "last_from": last_from, "heard_after": heard_after, "others": others, "step": step, "dead": kind != "soft" and not heard_after})
+    return out
+BOUNCE_COLS = ["Email", "Name", "Company", "Last bounce", "Bounces", "Kind", "Status code", "Reason", "Subject David had sent", "Found by", "Last time David wrote to them", "Last time they wrote to David", "Wrote after bounce", "Other addresses with the same name", "Next step"]
+def cmd_bounces(a):
+    db = opendb(a.db); n = build_bounces(db); rows = bounce_rows(db); os.makedirs(a.out, exist_ok=True)
+    write_csv(os.path.join(a.out, "bounces.csv"), [BOUNCE_COLS] + [[cell(x) for x in [r["addr"], r["name"], r["company"], ymd(r["ts"]), r["n"], r["kind"], r["status"], r["reason"], r["orig"], r["how"], ymd(r["last_to"]), ymd(r["last_from"]), "yes" if r["heard_after"] else "no", "; ".join(r["others"]), r["step"]]] for r in rows])
+    nb = db.execute("select count(*) from messages where dreason=?", (DSN_REASON,)).fetchone()[0]
+    print(f"bounces: {nb} delivery-failure messages -> {len(rows)} addresses David wrote to ({sum(r['dead'] for r in rows)} need a current-address lookup) -> {a.out}/bounces.csv")
+    for r in rows[:20]: print(f"  {r['addr']} | {r['kind']} {r['status']} | {ymd(r['ts'])} | {r['reason'][:70]}" + (" | same name also: " + ", ".join(r["others"]) if r["others"] else ""))
+
+def load_decisions(db):
+    """{'contact': {email: row}, 'domain': {domain: row}} from the decisions table (survives every re-run; filter/link never touch it)"""
+    out = {"contact": {}, "domain": {}}
+    if has_table(db, "decisions"):
+        for r in db.execute("select * from decisions"): out[r["kind"]][r["key"]] = r
+    return out
+def decision_for(dm, addr, domain): return dm["contact"].get(addr) or dm["domain"].get(domain)
+def dnc_file(out_dir):
+    """David's own do-not-contact list: out/do-not-contact.csv, one address or domain per line (optional note after a comma)"""
+    s = {"contact": set(), "domain": set()}; p = os.path.join(out_dir, "do-not-contact.csv")
+    if os.path.exists(p):
+        with open(p, encoding="utf-8-sig", newline="") as fh:
+            for r in csv.reader(fh):
+                k = (r[0] if r else "").strip().lower()
+                if not k or k.startswith("#") or k in ("email", "address", "domain", "email/domain"): continue
+                (s["contact"] if "@" in k else s["domain"]).add(k.lstrip("@"))
+    return s
+def is_dnc(dm, dnc, addr, domain):
+    d = decision_for(dm, addr, domain)
+    return addr in dnc["contact"] or domain in dnc["domain"] or bool(d and d["decision"] == "do-not-contact")
+def cmd_decide(a):
+    """record the bot's (or David's) triage decision for a contact or a whole domain; re-runs never erase it and export honors it"""
+    items = []
+    if a.from_csv:
+        with open(a.from_csv, encoding="utf-8-sig", newline="") as fh:
+            for r in csv.DictReader(fh):
+                r = {(k or "").strip().lower(): (v or "").strip() for k, v in r.items()}
+                items.append(("contact" if r.get("email") else "domain", (r.get("email") or r.get("domain") or "").lower(), r.get("decision", ""), r.get("role", ""), r.get("note", ""), r.get("evidence", "")))
+    for e in a.email or []: items.append(("contact", e.strip().lower(), a.decision or "", a.role or "", a.note or "", a.evidence or ""))
+    for d in a.domain or []: items.append(("domain", d.strip().lower().lstrip("@"), a.decision or "", a.role or "", a.note or "", a.evidence or ""))
+    if not items: raise SystemExit("decide: give --email ADDR and/or --domain DOMAIN (or --from-csv FILE with columns Email,Domain,Decision,Role,Note,Evidence)")
+    db = opendb(a.db); n = 0
+    for kind, key, dec, role, note, ev in items:
+        if not key or (kind == "contact" and "@" not in key): raise SystemExit(f"decide: bad key {key!r}")
+        if a.remove: db.execute("delete from decisions where kind=? and key=?", (kind, key)); n += 1; continue
+        if dec not in DECISIONS: raise SystemExit(f"decide: --decision must be one of {', '.join(DECISIONS)} (got {dec!r} for {key})")
+        if role and role not in ROLES: raise SystemExit(f"decide: --role must be one of {', '.join(ROLES)} (got {role!r} for {key})")
+        old = db.execute("select role, note, evidence from decisions where kind=? and key=?", (kind, key)).fetchone()
+        if old and not a.replace:                       # a later call that leaves a field out keeps what was recorded before
+            role, note, ev = role or old["role"], note or old["note"], ev or old["evidence"]
+        db.execute("insert or replace into decisions values(?,?,?,?,?,?,?)", (kind, key, dec, role, note, ev, int(time.time()))); n += 1
+    db.commit(); print(f"decide: {'removed' if a.remove else 'recorded'} {n} decision(s). Run `export` to write them into contacts.csv / crm-contacts.csv.")
+def sample_subjects(db, addr, k=4):
+    seen, out = set(), []
+    for r in db.execute("select t.subj from thread_contacts tc join threads t on t.id=tc.tid where tc.addr=? order by t.last_ts desc", (addr,)):
+        key = norm_subject(r[0])
+        if key and key not in seen: seen.add(key); out.append((r[0] or "")[:80])
+        if len(out) >= k: break
+    return out
+def cmd_decisions(a):
+    db = open_ro(a.db); dm = load_decisions(db); dnc = dnc_file(a.out)
+    if not a.pending:
+        print(f"{len(dm['contact'])} contact decisions, {len(dm['domain'])} domain decisions; do-not-contact file: {len(dnc['contact'])} addresses, {len(dnc['domain'])} domains")
+        for kind in ("domain", "contact"):
+            for key, r in sorted(dm[kind].items()): print(f"  {kind:7} {key} | {r['decision']} | {r['role'] or '-'} | {r['note'] or ''}")
+        return
+    lim = a.limit or 30; n = 0; tot = 0
+    for c in db.execute("select * from contacts where coalesce(kind,'person')='person' order by last_ts desc"):
+        if decision_for(dm, c["addr"], c["domain"]) or is_dnc(dm, dnc, c["addr"], c["domain"]): continue
+        tot += 1
+        if n >= lim: continue
+        n += 1; tw = "two-way" if c["n_from"] and c["n_to"] else ("they wrote only" if c["n_from"] else "David wrote only")
+        print(f"{c['addr']} | {c['name']} | {c['company']} | {c['title']} | last {ymd(c['last_ts'])} | {tw} ({c['n_from']} from / {c['n_to']} to) | {c['n_threads']} threads | " + "; ".join(sample_subjects(db, c["addr"], 3)))
+    print(f"-- {n} shown, {tot} contacts still without a decision (newest first). Record decisions with `decide`.")
+
+def show_message(db, m, a):
+    to = collections.defaultdict(list)
+    for r in db.execute("select role, addr, name from addrs where mid=?", (m["id"],)): to[r["role"]].append(f"{r['name']} <{r['addr']}>" if r["name"] else r["addr"])
+    who = "David" if m["is_sent"] else (f"{m['from_name']} <{m['from_addr']}>" if m["from_name"] else m["from_addr"])
+    atts = [x.get("name") or "?" for x in json.loads(m["att"] or "[]")] if m["has_att"] else []
+    print(f"--- message {m['id']} | {stamp(m['ts'])} | from {who} | to {', '.join(to['to']) or '-'}" + (f" | cc {', '.join(to['cc'])}" if to["cc"] else "") + (f" | attachments: {', '.join(atts)}" if atts else ""))
+    if m["subject"]: print(f"    subject: {m['subject']}")
+    b = db.execute("select text, quoted, sig, trunc from bodies where mid=?", (m["id"],)).fetchone()
+    if not b: print(f"    (no body stored: decision={m['decision']}, folder={m['folder']}; re-run `fetch` if the folder is deep)"); return
+    t = (b["text"] or "").strip(); cap = a.chars if a.chars is not None else 1500
+    if cap and len(t) > cap: t = t[:cap].rstrip() + f"\n    […{len(b['text']) - cap:,} more characters; use --chars 0 for all]"
+    print("\n".join("    " + l for l in (t or "(empty body)").splitlines()))
+    if a.sig and b["sig"]: print("    [signature]\n" + "\n".join("    " + l for l in b["sig"].strip().splitlines()))
+    if a.quoted and b["quoted"]: print("    [quoted history]\n" + "\n".join("    > " + l for l in b["quoted"].strip().splitlines()))
+    if b["trunc"]: print("    [body was cut at the fetch size cap]")
+def cmd_show(a):
+    """plain-text view of stored mail for the bot: one thread, one message, a project, or everything with a contact / a company domain"""
+    db = open_ro(a.db); lim = a.limit or 40; lo, hi = parse_ymd(a.since), parse_ymd(a.before); tids = []; label = ""
+    if a.message:
+        m = db.execute("select * from messages where id=?", (a.message,)).fetchone()
+        if not m: raise SystemExit(f"no message {a.message}")
+        show_message(db, m, a); return
+    if a.thread: tids = [int(a.thread)]; label = f"thread {a.thread}"
+    elif a.project:
+        tids = [r[0] for r in db.execute("select tid from project_threads where pid=? order by tid", (a.project,))]; p = db.execute("select * from projects where id=?", (a.project,)).fetchone()
+        if not p: raise SystemExit(f"no project {a.project}")
+        label = f"project {p['id']}: {p['name']} ({ymd(p['first_ts'])} to {ymd(p['last_ts'])}; contacts: {p['contacts']}; why: {p['why']})"
+    elif a.email or a.domain:
+        addrs = [e.lower() for e in (a.email or [])]
+        for d in a.domain or []: addrs += [r[0] for r in db.execute("select addr from contacts where domain=?", (d.lower().lstrip("@"),))]
+        if not addrs: raise SystemExit("no contacts for that domain; try `search` instead")
+        dm = load_decisions(db); dnc = dnc_file(a.out)
+        for ad in dict.fromkeys(addrs):
+            c = db.execute("select * from contacts where addr=?", (ad,)).fetchone()
+            if c:
+                d = decision_for(dm, ad, c["domain"]); st = "do-not-contact" if is_dnc(dm, dnc, ad, c["domain"]) else (d["decision"] if d else "undecided")
+                print(f"CONTACT {c['name']} <{ad}> | {c['title'] or 'no title'} at {c['company'] or '?'} | {c['phone'] or 'no phone'} | {ymd(c['first_ts'])} to {ymd(c['last_ts'])} | {c['n_from']} from them / {c['n_to']} to them | {c['n_threads']} threads | triage: {st}" + (f" ({d['role']}; {d['note']})" if d and (d["role"] or d["note"]) else ""))
+                for s in db.execute("select ts, title, company, phone from sigs where addr=? order by ts desc limit 3", (ad,)): print(f"    signature {ymd(s['ts'])}: {s['title'] or '-'} | {s['company'] or '-'} | {s['phone'] or '-'}")
+            else: print(f"CONTACT <{ad}> is not in contacts (never linked)")
+        tids = [r[0] for r in db.execute(f"select distinct tid from thread_contacts where addr in ({','.join('?' * len(addrs))}) order by tid", addrs)]; label = "threads with " + ", ".join(dict.fromkeys(addrs))
+    else: raise SystemExit("show: give --thread ID, --message ID, --project ID, --email ADDR, or --domain DOMAIN")
+    th = []
+    for t in tids:
+        r = db.execute("select t.*, (select pid from project_threads where tid=t.id) pid from threads t where t.id=?", (t,)).fetchone()
+        if r and (not lo or (r["last_ts"] or 0) >= lo) and (not hi or (r["first_ts"] or 0) < hi): th.append(r)
+    th.sort(key=lambda r: r["first_ts"] or 0, reverse=bool(a.newest))
+    print(f"== {label}: {len(th)} thread(s)" + (f" between {a.since or 'start'} and {a.before or 'now'}" if lo or hi else ""))
+    for r in th: print(f"   thread {r['id']} | {ymd(r['first_ts'])} to {ymd(r['last_ts'])} | {r['n']} msgs | {r['subj']}" + (f" | project {r['pid']}" if r["pid"] else ""))
+    if a.list: return
+    left = lim
+    for r in th:
+        ms = db.execute("select * from messages where thread=? order by ts, id", (r["id"],)).fetchall()
+        ms = [m for m in ms if (not lo or (m["ts"] or 0) >= lo) and (not hi or (m["ts"] or 0) < hi)]
+        if left <= 0: break
+        print(f"\n=== thread {r['id']}: {r['subj']} ({ymd(r['first_ts'])} to {ymd(r['last_ts'])}, {r['n']} messages)")
+        for m in ms[:left]: show_message(db, m, a)
+        left -= min(left, len(ms))
+    shown = lim - left; total = sum(r["n"] for r in th)
+    if shown < total: print(f"\n[{total - shown} more message(s) not shown (limit {lim}); narrow with --thread/--since/--before or raise --limit]")
+def cmd_search(a):
+    """case-insensitive AND-search over stored subjects, bodies and signatures; prints message id + thread id so `show` can open the thread"""
+    terms = [t.casefold() for t in a.terms if t.strip()]
+    if not terms: raise SystemExit("search: give one or more terms (all must match), e.g.  search \"creative advertising\" paramount")
+    db = open_ro(a.db); lim = a.limit or 25; lo, hi = parse_ymd(a.since), parse_ymd(a.before); fld = a.field or "all"
+    hay = {"subject": "fold(coalesce(m.subject,''))", "body": "fold(coalesce(b.text,'') || char(10) || coalesce(b.sig,''))", "all": "fold(coalesce(m.subject,'') || char(10) || coalesce(b.text,'') || char(10) || coalesce(b.sig,''))"}[fld]
+    where = ["m.decision != 'dup'" if a.include_noise else "m.decision = 'keep'"]; par = []
+    for t in terms: where.append(f"instr({hay}, ?) > 0"); par.append(t)
+    if lo: where.append("m.ts >= ?"); par.append(lo)
+    if hi: where.append("m.ts < ?"); par.append(hi)
+    for e in a.email or []: where.append("(m.from_addr=? or exists(select 1 from addrs x where x.mid=m.id and x.addr=?))"); par += [e.lower(), e.lower()]
+    for d in a.domain or []: where.append("(m.from_addr like ? or exists(select 1 from addrs x where x.mid=m.id and x.addr like ?))"); par += ["%@" + d.lower().lstrip("@")] * 2
+    q = f"select m.id, m.thread, m.ts, m.is_sent, m.from_addr, m.from_name, m.subject, m.decision, b.text, b.sig from messages m left join bodies b on b.mid=m.id where {' and '.join(where)} order by m.ts desc"
+    n = 0
+    for r in db.execute(q, par):
+        n += 1
+        if n > lim: continue
+        body = (r["text"] or "") + "\n" + (r["sig"] or ""); low = body.casefold(); pos = next((low.find(t) for t in terms if low.find(t) >= 0), -1)
+        snip = re.sub(r"\s+", " ", body[max(0, pos - 90):pos + 140]).strip() if pos >= 0 else ""
+        who = "David" if r["is_sent"] else (r["from_name"] or r["from_addr"])
+        print(f"msg {r['id']} | thread {r['thread'] if r['thread'] is not None else '-'} | {ymd(r['ts'])} | {who} <{r['from_addr']}> | {r['subject']}" + ("" if r["decision"] == "keep" else f" | [{r['decision']}]") + (f"\n    …{snip}…" if snip else ""))
+    print(f"-- {min(n, lim)} of {n} matching message(s) shown. Open one with: show --thread ID  (or --message ID)")
+
 def cell(x, cap=1000):
     """CSV cells stay readable for the bot: one line, capped length"""
     if x is None: return ""
     if isinstance(x, float) and x.is_integer(): x = int(x)
     t = re.sub(r"\s+", " ", str(x)).strip()
     return t if len(t) <= cap else t[:cap - 1] + "…"
-CONTACT_COLS = ["Name", "Email", "Company", "Title", "Phone", "Domain", "Name source", "First contact", "Last contact", "Messages from them", "Messages to them", "Threads", "Projects"]
-COMPANY_COLS = ["Company", "Domain", "Contacts", "Shared inboxes", "Threads", "First contact", "Last contact"]
+CONTACT_COLS = ["Name", "Email", "Company", "Title", "Phone", "Domain", "Name source", "First contact", "Last contact", "Messages from them", "Messages to them", "Threads", "Projects",
+                "Two-way", "Sample subjects", "Attachment types", "Same name, other addresses", "Decision", "Role", "Triage note", "Outreach status"]
+COMPANY_COLS = ["Company", "Domain", "Contacts", "Shared inboxes", "Threads", "First contact", "Last contact", "People", "Decision", "Role", "Triage note"]
+DECISION_COLS = ["Kind", "Key", "Decision", "Role", "Note", "Evidence", "Decided at"]
 THREAD_COLS = ["Thread ID", "Subject", "First date", "Last date", "Messages", "Messages from David", "Contacts", "Attachments", "Project ID"]
 PROJECT_COLS = ["Project ID", "Project", "First date", "Last date", "Years", "Threads", "Messages", "Contacts", "Companies", "Thread IDs", "Why included"]
 def cmd_export(a):
@@ -1293,15 +1529,44 @@ def cmd_export(a):
     for r in db.execute("select tid, addr from thread_contacts"):
         if r[0] in t2p: c_proj[r[1]].add(t2p[r[0]])
     allc = sorted(con.values(), key=lambda r: -(r["last_ts"] or 0)); rows = [r for r in allc if (r["kind"] or "person") == "person"]
-    W("contacts.csv", CONTACT_COLS, [[r["name"], r["addr"], r["company"], r["title"], r["phone"], r["domain"], r["name_src"], ymd(r["first_ts"]), ymd(r["last_ts"]), r["n_from"], r["n_to"], r["n_threads"],
-                                       "; ".join(proj[p]["name"] for p in sorted(c_proj[r["addr"]], key=lambda p: -proj[p]["last_ts"])[:10])] for r in rows])
+    dm = load_decisions(db); dnc = dnc_file(a.out); build_bounces(db); br = bounce_rows(db); dead = {b["addr"] for b in br if b["dead"]}
+    subj_of = collections.defaultdict(list)
+    for r in db.execute("select tc.addr, t.subj from thread_contacts tc join threads t on t.id=tc.tid order by t.last_ts desc"): subj_of[r[0]].append(r[1] or "")
+    att_t = collections.defaultdict(collections.Counter)
+    for r in db.execute("select thread, att from messages where has_att=1 and decision='keep' and thread is not null"):
+        for x in json.loads(r["att"] or "[]"): att_t[r["thread"]][(os.path.splitext(x.get("name") or "")[1].lower().lstrip(".") or "none")] += 1
+    att_c = collections.defaultdict(collections.Counter)
+    for r in db.execute("select tid, addr from thread_contacts"): att_c[r[1]].update(att_t.get(r[0], {}))
+    byname = collections.defaultdict(set)
+    for r in allc:
+        if (r["kind"] or "person") == "person" and len((r["name"] or "").split()) >= 2 and name_key(r["name"]): byname[name_key(r["name"])].add(r["addr"])
+    def subjects(ad, k=4):
+        seen, out = set(), []
+        for s_ in subj_of.get(ad, []):
+            key = norm_subject(s_)
+            if key and key not in seen: seen.add(key); out.append(s_[:80])
+            if len(out) >= k: break
+        return " | ".join(out)
+    def triage(r):
+        d = decision_for(dm, r["addr"], r["domain"]); dn = is_dnc(dm, dnc, r["addr"], r["domain"])
+        return (d["decision"] if d else "", d["role"] if d else "", d["note"] if d else "", "do-not-contact" if dn else ("bounced: find current address" if r["addr"] in dead else "ok"))
+    def crow(r):
+        tw = "two-way" if r["n_from"] and r["n_to"] else ("they wrote only" if r["n_from"] else "David wrote only"); k = name_key(r["name"] or "")
+        return [r["name"], r["addr"], r["company"], r["title"], r["phone"], r["domain"], r["name_src"], ymd(r["first_ts"]), ymd(r["last_ts"]), r["n_from"], r["n_to"], r["n_threads"],
+                "; ".join(proj[p]["name"] for p in sorted(c_proj[r["addr"]], key=lambda p: -proj[p]["last_ts"])[:10]), tw, subjects(r["addr"]),
+                "; ".join(f"{e} x{n}" for e, n in att_c[r["addr"]].most_common(6)), "; ".join(sorted(byname.get(k, set()) - {r["addr"]})[:5]) if k else ""] + list(triage(r))
+    W("contacts.csv", CONTACT_COLS, [crow(r) for r in rows])
+    if dm["contact"] or dm["domain"]: W("crm-contacts.csv", CONTACT_COLS, [crow(r) for r in rows if (decision_for(dm, r["addr"], r["domain"]) or {"decision": ""})["decision"] == "keep"])
+    elif os.path.exists(os.path.join(a.out, "crm-contacts.csv")): os.remove(os.path.join(a.out, "crm-contacts.csv"))
+    W("bounces.csv", BOUNCE_COLS, [[r["addr"], r["name"], r["company"], ymd(r["ts"]), r["n"], r["kind"], r["status"], r["reason"], r["orig"], r["how"], ymd(r["last_to"]), ymd(r["last_from"]), "yes" if r["heard_after"] else "no", "; ".join(r["others"]), r["step"]] for r in br])
+    W("decisions.csv", DECISION_COLS, [[kind, key, d["decision"], d["role"], d["note"], d["evidence"], stamp(d["ts"])] for kind in ("domain", "contact") for key, d in sorted(dm[kind].items())])
     co = {}
     for r in allc:
         key = r["domain"] if r["domain"] not in FREE else ("co:" + re.sub(r"[^a-z0-9]", "", r["company"].lower()) if r["company"] else "")
         if not key or key == "co:": continue
-        e = co.setdefault(key, {"names": collections.Counter(), "dom": r["domain"] if r["domain"] not in FREE else "", "ppl": 0, "shared": [], "thr": set(), "first": r["first_ts"], "last": r["last_ts"]})
+        e = co.setdefault(key, {"names": collections.Counter(), "dom": r["domain"] if r["domain"] not in FREE else "", "ppl": 0, "shared": [], "thr": set(), "first": r["first_ts"], "last": r["last_ts"], "who": []})
         if r["company"]: e["names"][r["company"]] += 1
-        if (r["kind"] or "person") == "person": e["ppl"] += 1
+        if (r["kind"] or "person") == "person": e["ppl"] += 1; e["who"].append(f"{r['name'] or r['addr']}" + (f" ({r['title']})" if r["title"] else ""))
         else: e["shared"].append(r["addr"])
         e["first"] = min(x for x in (e["first"], r["first_ts"]) if x) if (e["first"] or r["first_ts"]) else None; e["last"] = max(e["last"] or 0, r["last_ts"] or 0)
     for r in db.execute("select tid, addr from thread_contacts"):
@@ -1309,7 +1574,10 @@ def cmd_export(a):
         if c:
             k = c["domain"] if c["domain"] not in FREE else ("co:" + re.sub(r"[^a-z0-9]", "", c["company"].lower()) if c["company"] else "")
             if k in co: co[k]["thr"].add(r[0])
-    W("companies.csv", COMPANY_COLS, [[e["names"].most_common(1)[0][0] if e["names"] else org_label(e["dom"]), e["dom"], e["ppl"], "; ".join(sorted(e["shared"])[:10]), len(e["thr"]), ymd(e["first"]), ymd(e["last"])] for e in sorted(co.values(), key=lambda e: (-e["ppl"], -(e["last"] or 0)))])
+    def cdec(e):
+        d = dm["domain"].get(e["dom"]) if e["dom"] else None
+        return [d["decision"], d["role"], d["note"]] if d else ["", "", ""]
+    W("companies.csv", COMPANY_COLS, [[e["names"].most_common(1)[0][0] if e["names"] else org_label(e["dom"]), e["dom"], e["ppl"], "; ".join(sorted(e["shared"])[:10]), len(e["thr"]), ymd(e["first"]), ymd(e["last"]), "; ".join(e["who"][:8])] + cdec(e) for e in sorted(co.values(), key=lambda e: (-e["ppl"], -(e["last"] or 0)))])
     tc = collections.defaultdict(list)
     for r in db.execute("select tid, addr from thread_contacts order by addr"): tc[r[0]].append(r[1])
     trows = []
@@ -1329,10 +1597,12 @@ def cmd_export(a):
     md = [f"# Mining summary ({utcnow()})", "", "Extraction only: contacts, the threads they are in, and the projects those threads form. No scoring or labels.", "",
           f"- Messages read (headers): {n_msg:,}; kept: {dec.get('keep', 0):,}; junk/automated: {dec.get('noise', 0):,}; duplicates: {dec.get('dup', 0):,}",
           f"- Contacts (unique addresses of people): {len(rows):,}; shared company inboxes David wrote to (listed in companies.csv): {len(allc) - len(rows):,}; with a full name: {sum(1 for r in rows if is_full_name(r['name'] or '')):,}; name from signature: {sum(1 for r in rows if r['name_src'] == 'signature'):,}",
-          f"- Threads with contacts: {len(trows):,}; projects: {len(prow):,} (covering {len(t2p):,} threads)", f"- Companies: {len(co):,}", "",
+          f"- Threads with contacts: {len(trows):,}; projects: {len(prow):,} (covering {len(t2p):,} threads)", f"- Companies: {len(co):,}",
+          f"- Bounced addresses David wrote to: {len(br):,} ({len(dead):,} need a current-address lookup); decisions recorded: {len(dm['contact']) + len(dm['domain']):,}; do-not-contact: {sum(1 for r in rows if is_dnc(dm, dnc, r['addr'], r['domain'])):,}", "",
           "## Contacts by year of last contact", ""] + [f"- {y}: {n:,}" for y, n in sorted(yrs.items())] + ["", "## Files", "",
           "- contacts.csv: one row per unique email address", "- companies.csv: company domains (and signature company names for personal addresses)",
           "- threads.csv: every conversation with at least one contact; Project ID when it belongs to a project", "- projects.csv: groups of work threads; `Why included` lists the words/files that qualified it",
+          "- bounces.csv: addresses David wrote to that bounced (needs a current-address lookup), with evidence", "- decisions.csv / crm-contacts.csv: the bot's recorded triage decisions, and the contacts decided `keep` (only once decisions exist)",
           f"- {os.path.basename(a.db)}: SQLite with all headers, kept bodies, threads, contacts and projects (tables: messages, addrs, bodies, sigs, threads, contacts, thread_contacts, projects, project_threads)"]
     write_text(os.path.join(a.out, "summary.md"), "\n".join(md) + "\n")
     stage(db, "export", "done"); print(f"export: contacts {len(rows)}, companies {len(co)}, threads {len(trows)}, projects {len(prow)} -> {a.out}/ (summary.md first)")
@@ -1381,7 +1651,7 @@ def cmd_run(a):
     print("run complete: read summary.md first")
 def build_parser():
     p = argparse.ArgumentParser(prog="dcrmine", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("cmd", choices=["survey", "approve-survey", "crawl", "filter", "fetch", "thread", "link", "projects", "export", "run", "status", "seen-audit"])
+    p.add_argument("cmd", choices=["survey", "approve-survey", "crawl", "filter", "fetch", "thread", "link", "projects", "export", "run", "status", "seen-audit", "bounces", "decide", "decisions", "show", "search"])
     p.add_argument("--db", default="dcr_mail.sqlite"); p.add_argument("--out", default="mining-out", help="work dir: survey + exports")
     p.add_argument("--host", default="imap.mail.me.com"); p.add_argument("--port", type=int, default=993); p.add_argument("--plain", action="store_true", help="no TLS (test fixture only)")
     p.add_argument("--user", default=os.environ.get("DCR_IMAP_USER")); p.add_argument("--pass-env", default="ICLOUD_APP_PASSWORD"); p.add_argument("--timeout", type=int, default=90)
@@ -1392,13 +1662,22 @@ def build_parser():
     p.add_argument("--force", action="store_true", help="seen-audit: replace the saved baseline")
     p.add_argument("--since", help="crawl: only messages dated on/after YYYY or YYYY-MM-DD (bounded first run)"); p.add_argument("--before", help="crawl: only messages dated before YYYY or YYYY-MM-DD")
     p.add_argument("--limit", type=int, help="crawl: at most N new messages per folder this run (newest first); re-run to continue")
+    p.add_argument("terms", nargs="*", help="search: words that must all appear")
+    p.add_argument("--thread"); p.add_argument("--project"); p.add_argument("--message"); p.add_argument("--email", action="append"); p.add_argument("--domain", action="append")
+    p.add_argument("--chars", type=int, help="show: max characters of each message body (default 1500; 0 = all)"); p.add_argument("--quoted", action="store_true", help="show: also print quoted history")
+    p.add_argument("--sig", action="store_true", help="show: also print signatures"); p.add_argument("--list", action="store_true", help="show: only list the threads"); p.add_argument("--ids", help="fetch: comma-separated message ids whose text to download now, even if the filter dropped them (see `search --include-noise`)"); p.add_argument("--newest", action="store_true", help="show: newest thread first (default oldest first)")
+    p.add_argument("--field", choices=["all", "subject", "body"], help="search: where to look (default all)"); p.add_argument("--include-noise", action="store_true", help="search: also look at messages the filter dropped as noise")
+    p.add_argument("--decision", help="decide: " + "|".join(DECISIONS)); p.add_argument("--role", help="decide: " + "|".join(ROLES)); p.add_argument("--note"); p.add_argument("--evidence")
+    p.add_argument("--from-csv", dest="from_csv", help="decide: CSV with columns Email,Domain,Decision,Role,Note,Evidence"); p.add_argument("--remove", action="store_true", help="decide: delete the decision")
+    p.add_argument("--replace", action="store_true", help="decide: overwrite role/note/evidence even when left blank"); p.add_argument("--pending", action="store_true", help="decisions: list contacts that have no decision yet")
     p.add_argument("--version", action="version", version="dcrmine " + VERSION)
     return p
-READ_ONLY_CMDS = {"status"}
+READ_ONLY_CMDS = {"status", "show", "search", "decisions", "decide"}   # no run lock: never touch the mailbox; decide only writes one small table (SQLite busy-timeout covers a running job)
 def main(argv=None):
     a = build_parser().parse_args(argv)
     fn = {"survey": cmd_survey, "approve-survey": cmd_approve, "crawl": cmd_crawl, "filter": cmd_filter, "fetch": cmd_fetch, "thread": cmd_thread, "link": cmd_link, "projects": cmd_projects,
-          "export": cmd_export, "run": cmd_run, "status": cmd_status, "seen-audit": cmd_seen_audit}[a.cmd]
+          "export": cmd_export, "run": cmd_run, "status": cmd_status, "seen-audit": cmd_seen_audit, "bounces": cmd_bounces, "decide": cmd_decide,
+          "decisions": cmd_decisions, "show": cmd_show, "search": cmd_search}[a.cmd]
     if a.cmd in READ_ONLY_CMDS or a.cmd == "seen-audit": return fn(a)
     with RunLock(a.db):
         try: return fn(a)

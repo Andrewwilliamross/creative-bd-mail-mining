@@ -2,7 +2,7 @@
 
 This runbook is for the bot that runs the backfill on the Debian VM as user `box`. Follow the steps in order. Two steps need the human: step 2 (approve the survey) and step 3 (look at the pilot). Everything else is yours to do.
 
-**What this produces:** the people David has emailed with over the years (`contacts.csv`), their companies (`companies.csv`), every conversation linked to those people (`threads.csv`), and work conversations grouped into projects (`projects.csv`).
+**What this produces:** the people David has emailed with over the years (`contacts.csv`), their companies (`companies.csv`), every conversation linked to those people (`threads.csv`), work conversations grouped into projects (`projects.csv`), and addresses that bounced (`bounces.csv`). The files are raw, sifted input: they still contain vendors, personal contacts and one-off senders. Deciding who is a real business-development contact is the bot's next job (the crm-signal-triage skill), using `show`, `search` and `decide` below.
 
 **Rules that never bend**
 - The tool only reads mail. It never sends, deletes, moves or marks anything as read. Do not edit `dcrmine.py`.
@@ -77,8 +77,24 @@ Send the human:
 - `out/companies.csv`, companies, with their shared inboxes (`info@`, `hello@` …) that David wrote to
 - `out/threads.csv`, every conversation with its contacts and, if any, its project
 - `out/projects.csv`, work conversations grouped by job
+- `out/bounces.csv`, addresses that bounced and need a current-address lookup
 
 Keep `dcr_mail.sqlite`. It holds everything, so later questions can be answered without touching the mailbox again.
+
+## 7. Work with the stored mail (no mailbox access, safe any time, even while a job runs)
+```bash
+$M show --email someone@company.com            # card + every thread with them, oldest first; add --limit/--chars/--since
+$M show --thread 38 --chars 0 --sig --quoted    # one thread in full
+$M show --domain company.com --list             # which threads exist for a company
+$M show --project 4                             # every thread in a project
+$M search "creative advertising" paramount      # all terms must match; subject, body, signature
+$M decisions --pending --limit 30               # next batch of contacts nobody has decided on
+$M decide --email a@b.com --decision keep --role buyer --evidence "thread 38: hired David for the NOBL set"
+$M decide --domain vendor.com --decision junk --role vendor
+$M export                                       # writes the decisions into contacts.csv, crm-contacts.csv, decisions.csv
+```
+If `show` says `no body stored` for a message you need (the filter dropped it, or its folder is headers-only), download just that message: `$M fetch --ids 123,124` (read-only BODY.PEEK), then `show --message 123`.
+Decisions live in the database, so every re-run (`filter`, `link`, `export`) keeps them. David's do-not-contact list goes in `out/do-not-contact.csv` (one address or domain per line). Nothing here sends, edits or marks mail.
 
 ## Fixing results later (no mailbox access needed)
 After editing `out/sender-overrides.csv` or `self_addresses`:
@@ -86,6 +102,7 @@ After editing `out/sender-overrides.csv` or `self_addresses`:
 $M filter && $M thread && $M link && $M projects && $M export
 ```
 If the filter now keeps mail it dropped before, run `$M run` once more to download those message texts.
+The text of bounce notices is fetched by `fetch` along with the kept mail; `$M bounces` reads it.
 
 ## What gets left out on purpose
 - newsletters, receipts, notifications and other automated mail, even from companies David once wrote to

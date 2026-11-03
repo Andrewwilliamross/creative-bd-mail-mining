@@ -2,11 +2,12 @@
 import csv, json, os, re, shutil, unittest
 from helpers import ENV, ROOT, Workdir, read_only_violations
 
-CONTACTS = ["Name", "Email", "Company", "Title", "Phone", "Domain", "Name source", "First contact", "Last contact", "Messages from them", "Messages to them", "Threads", "Projects"]
-COMPANIES = ["Company", "Domain", "Contacts", "Shared inboxes", "Threads", "First contact", "Last contact"]
+CONTACTS = ["Name", "Email", "Company", "Title", "Phone", "Domain", "Name source", "First contact", "Last contact", "Messages from them", "Messages to them", "Threads", "Projects",
+            "Two-way", "Sample subjects", "Attachment types", "Same name, other addresses", "Decision", "Role", "Triage note", "Outreach status"]
+COMPANIES = ["Company", "Domain", "Contacts", "Shared inboxes", "Threads", "First contact", "Last contact", "People", "Decision", "Role", "Triage note"]
 THREADS = ["Thread ID", "Subject", "First date", "Last date", "Messages", "Messages from David", "Contacts", "Attachments", "Project ID"]
 PROJECTS = ["Project ID", "Project", "First date", "Last date", "Years", "Threads", "Messages", "Contacts", "Companies", "Thread IDs", "Why included"]
-OUTPUTS = ["survey-report.md", "mining-plan.json", "summary.md", "contacts.csv", "companies.csv", "threads.csv", "projects.csv"]
+OUTPUTS = ["survey-report.md", "mining-plan.json", "summary.md", "contacts.csv", "companies.csv", "threads.csv", "projects.csv", "bounces.csv", "decisions.csv"]
 
 
 def load(path):
@@ -100,8 +101,8 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(self.w.sql("select count(*) from messages where folder in ('Junk','Trash','Drafts')")[0][0], 0)
 
     def test_bodies_only_for_survivors_and_decoded(self):
-        bad = self.w.sql("select count(*) from bodies b join messages m on m.id=b.mid where m.decision != 'keep'")[0][0]
-        self.assertEqual(bad, 0)
+        bad = self.w.sql("select count(*) from bodies b join messages m on m.id=b.mid where m.decision != 'keep' and m.dreason != 'delivery failure notice'")[0][0]
+        self.assertEqual(bad, 0)                                                # the only non-kept bodies are bounce notices (read by `bounces`)
         txt = self.w.sql("select b.text, m.subject, m.from_name from bodies b join messages m on m.id=b.mid where m.from_addr='rene@pariscreative.example' and m.ts < 946684800")[0]
         self.assertIn("décor du café", txt[0]); self.assertEqual(txt[1], "Devis décor - café set"); self.assertEqual(txt[2], "René Dupont")
         subj = self.w.sql("select subject from messages where from_addr='ko@studioko.example'")[0][0]
