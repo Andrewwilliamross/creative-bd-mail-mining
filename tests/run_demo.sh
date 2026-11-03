@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
-# End-to-end test of dcrmine against the synthetic read-only fake IMAP server. Usage: ./run_demo.sh [outdir]
+# Human-readable end-to-end demo of dcrmine against the synthetic read-only fake IMAP server (the assertions live in the unittest suite).
+# Usage from a fresh clone: tests/run_demo.sh [outdir]      (default: tests/demo-out)
 set -euo pipefail
-cd "$(dirname "$0")"; OUT=${1:-demo-out}; PORT=${PORT:-1143}; rm -rf "$OUT"; mkdir -p "$OUT"
+cd "$(dirname "$0")"; ROOT=$(cd .. && pwd); PY=${PYTHON:-python3}
+OUT=${1:-demo-out}; PORT=${PORT:-1143}; rm -rf "$OUT"; mkdir -p "$OUT"
 export DCR_IMAP_USER=dcr.demo@mac.com ICLOUD_APP_PASSWORD=testpw     # fixture-only throwaway password
-python3 fake_imap.py serve --port $PORT --drop-after ${DROP_AFTER:-6} --log "$OUT/imap-commands.log" > "$OUT/server.out" 2>&1 & SRV=$!
+$PY fake_imap.py serve --port $PORT --drop-after ${DROP_AFTER:-6} --log "$OUT/imap-commands.log" > "$OUT/server.out" 2>&1 & SRV=$!
 trap 'kill $SRV 2>/dev/null || true' EXIT; sleep 1.5
-C="python3 dcrmine.py --plain --host 127.0.0.1 --port $PORT --db $OUT/mail.sqlite --out $OUT --timeout 10"
-echo "== Stage 0 survey"; $C survey
-echo "== crawl before approval must be refused"; ($C crawl 2>&1 || true) | tail -1
-$C approve-survey
-echo "== mining"; for s in crawl filter fetch thread link classify export voice; do echo "-- $s"; $C $s 2>&1 | tail -4; done
-$C classify 2>&1 | tail -1    # second run: cached, nothing re-run
-echo "== do-not-contact: David marks sam@noblgear.example; re-export must drop him from the queue (and nobody else)"
-echo "sam@noblgear.example" > "$OUT/do-not-contact.csv"; $C export | tail -1
-echo "== Stage 8: staple-project dossiers (live SEARCH + snowball)"
-python3 dcrdossier.py --seeds staple-seeds.json --live --plain --host 127.0.0.1 --port $PORT --db $OUT/mail.sqlite --out $OUT --timeout 10 2>&1 | grep -v "^[0-9:]* fetch:"
+CONN=(--plain --host 127.0.0.1 --port "$PORT" --db "$OUT/mail.sqlite" --out "$OUT" --timeout 10)
+C=("$PY" "$ROOT/dcrmine.py" "${CONN[@]}")
+echo "== Stage 0 survey"; "${C[@]}" --seeds "$ROOT/staple-seeds.example.json" survey
+echo "== crawl before approval must be refused"; ("${C[@]}" crawl 2>&1 || true) | tail -1
+"${C[@]}" approve-survey
+echo "== mining"; for s in crawl filter fetch thread link projects export; do echo "-- $s"; "${C[@]}" $s 2>&1 | tail -4; done
+echo "== outputs"; for f in contacts companies threads projects; do printf '%-14s %s rows\n' "$f.csv" "$(($(wc -l < "$OUT/$f.csv") - 1))"; done
 echo "== read-only audit of every IMAP command the server received"
-python3 - "$OUT/imap-commands.log" <<'PY'
+$PY - "$OUT/imap-commands.log" <<'PY'
 import re,sys,collections
 c=collections.Counter(); bad=[]
 for l in open(sys.argv[1]):

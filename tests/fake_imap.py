@@ -2,7 +2,7 @@
 """Synthetic mailbox + minimal READ-ONLY IMAP server for testing dcrmine (plain TCP, localhost only).
 All people/companies are fictional (*.example domains). Usage: python3 fake_imap.py serve --port 1143 [--drop-after N] [--log cmds.log]
 Records every command; any non-read-only command is logged as VIOLATION and refused."""
-import argparse, datetime as dt, email, email.utils, random, re, socketserver, sys, threading
+import argparse, datetime as dt, email, email.header, email.utils, random, re, socketserver, sys, threading, time
 from email.message import EmailMessage
 
 MON = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
@@ -26,13 +26,16 @@ P = {  # key: (name, email, title, company, phone, site)
 def sig(k): n, e, t, c, ph, s = P[k]; return SIG(n, t, c, ph, s) if t else f"\n\n{n}"
 class Box:
     def __init__(s): s.f = {}; s.n = 0
-    def add(s, folder, raw, d):
-        s.f.setdefault(folder, []).append({"raw": raw, "d": d, "uid": len(s.f.get(folder, [])) + 1, "flags": "\\Seen"})
+    def add(s, folder, raw, d, seen=None):
+        s.n += 1
+        if seen is None: seen = s.n % 6 != 0          # every 6th message starts unread: proves mining never sets \Seen
+        s.f.setdefault(folder, []).append({"raw": raw, "d": d, "uid": len(s.f.get(folder, [])) + 1, "flags": {"\\Seen"} if seen else set()})
+    def unseen(s): return {k: sorted(m["uid"] for m in v if "\\Seen" not in m["flags"]) for k, v in s.f.items()}
 def mk(frm, to, subj, body, date, mid, irt=None, refs=None, cc=None, atts=(), hdrs=None, nodate=False, rawdate=None):
     m = EmailMessage(); m["From"] = email.utils.formataddr(frm) if frm[0] else frm[1]; m["To"] = ", ".join(email.utils.formataddr(t) if t[0] else t[1] for t in to)
     if cc: m["Cc"] = ", ".join(email.utils.formataddr(t) for t in cc)
     m["Subject"] = subj
-    if not nodate: m["Date"] = rawdate or email.utils.format_datetime(date.replace(tzinfo=dt.timezone.utc))
+    if not nodate and not rawdate: m["Date"] = email.utils.format_datetime(date.replace(tzinfo=dt.timezone.utc))
     m["Message-ID"] = f"<{mid}@demo.example>"
     if irt: m["In-Reply-To"] = f"<{irt}@demo.example>"
     if refs: m["References"] = " ".join(f"<{r}@demo.example>" for r in refs)
@@ -40,7 +43,8 @@ def mk(frm, to, subj, body, date, mid, irt=None, refs=None, cc=None, atts=(), hd
     m.set_content(body)
     for fn, typ, data in atts:
         mt, st = typ.split("/"); m.add_attachment(data, maintype=mt, subtype=st, filename=fn)
-    return m.as_bytes()
+    raw = m.as_bytes()
+    return (b"Date: " + rawdate.encode() + b"\n" + raw) if (rawdate and not nodate) else raw   # inserted raw: old Pythons refuse to build junk dates
 def build(seed=7):
     R = random.Random(seed); B = Box(); cnt = [0]
     def nid(): cnt[0] += 1; return f"m{cnt[0]:05d}"
@@ -129,8 +133,45 @@ def build(seed=7):
     # Sent mail with personal notes (voice sample)
     for i, (k, t) in enumerate((("charlie", "Charlie - saw the trailer for the new release, congrats to you and the team. Hope the Paramount lot is treating you well."), ("pepsi", "Maria, happy new year! Nashville is treating us well; the shop is busy."))):
         d = D(2023, 12, 20 + i); B.add("Sent Messages", mk(ME, [(P[k][0], P[k][1])], "Happy holidays", t + "\n\nTalk soon,\nDavid", d, nid()), d)
+    # ---- 1990s encoding hell: raw 8-bit Latin-1 headers (no RFC 2047), 2-digit year + named zone, unknown charset label, mbox-import INTERNALDATE
+    raw90 = (b"From: Ren\xe9 Dupont <rene@pariscreative.example>\r\nTo: dcr.demo@mac.com\r\nSubject: Devis d\xe9cor - caf\xe9 set\r\n"
+             b"Date: Mon, 4 May 98 10:00:00 EST\r\nMessage-ID: <" + nid().encode() + b"@demo.example>\r\nContent-Type: text/plain; charset=iso-8859-1\r\n"
+             b"Content-Transfer-Encoding: 8bit\r\n\r\nBonjour David, voici le devis pour le d\xe9cor du caf\xe9: $4,200.\r\n")
+    B.add("Archive/Sets and Props Unlimited (imported)", raw90, imp)
+    rawq = mk(("Studio Ko", "ko@studioko.example"), [ME], "=?x-unknown?Q?Caf=E9_set_quote?=", "Quote for the cafe set is $3,100.", D(2004, 2, 2), nid())
+    B.add("Archive/Sets and Props Unlimited (imported)", rawq, imp)
+    # ---- a client folder whose name contains 'Bulk' (must NOT be treated as junk) and a modified-UTF-7 folder sent as a LIST literal
+    B.add("Bulk orders", mk(("Nina Ortiz", "nina@bulkbuy-demo.example"), [ME], "Quote request: 40 trade show booth backdrops", "Hi David, can you quote 40 backdrops for our trade show booth? Drawings attached.\n\nNina Ortiz\nProducer", D(2024, 9, 9), nid(), atts=[("drawings.pdf", "application/pdf", PDF("d"))]), D(2024, 9, 9))
+    B.add("Clients/M&APw-ller Studio", mk(("Jonas M\u00fcller", "jonas@mueller-studio.example"), [ME], "Set build for the M\u00fcller showroom", "Hallo David, we would like a quote for the showroom set build.", D(2023, 5, 5), nid()), D(2023, 5, 5))
+    # ---- a sender with a bare address (no display name): the contact's name must come from the signature
+    k1, k2 = nid(), nid()
+    B.add("INBOX", mk(("", "kwells@wellsscenic.example"), [ME], "Scenic paint quote for the showroom backdrop", "Hi David, paint quote attached for the showroom backdrop.\n\nThanks,\nKaren Wells\nCharge Artist\nWells Scenic\nT 615-555-0190",
+                      D(2024, 6, 3), k1, atts=[("paint_quote.pdf", "application/pdf", PDF("pq"))]), D(2024, 6, 3))
+    B.add("Sent Messages", mk(ME, [("", "kwells@wellsscenic.example")], "Re: Scenic paint quote for the showroom backdrop", "Thanks Karen, approved.\n\nDavid", D(2024, 6, 4), k2, irt=k1, refs=[k1]), D(2024, 6, 4))
+    # ---- David's own second address (sent to under his own name) and a bare first.last address with no name anywhere
+    B.add("Sent Messages", mk(ME, [("David Clay Ross", "david@dcrstudio.example")], "note to self: shop inventory", "Shop inventory list.\n\nDavid", D(2024, 1, 5), nid()), D(2024, 1, 5))
+    B.add("Sent Messages", mk(ME, [ME, ("David Clay Ross", "david@dcrstudio.example")], "backup: render files", "Render files for backup.\n\nDavid", D(2024, 1, 6), nid()), D(2024, 1, 6))
+    B.add("Sent Messages", mk(ME, [("", "jamie.rivera@riveraprops.example")], "Prop rental quote for the showroom", "Hi Jamie, can you quote the prop rental for the showroom set?\n\nDavid", D(2024, 6, 10), nid()), D(2024, 6, 10))
+    # ---- clutter that must not become contacts (found on a real mailbox)
+    LU = {"List-Unsubscribe": "<mailto:unsubscribe@lists.westsidelumber.example>"}
+    for i in range(4):   # a store's shared inbox: bulk promos, plus one real support exchange David started
+        B.add("INBOX", mk(("Westside Lumber", "hello@westsidelumber.example"), [ME], f"Westside Lumber weekly picks #{i}", "This week's picks.", D(2024, 3, 1 + i), nid(), hdrs=LU), D(2024, 3, 1 + i))
+    w1, w2 = nid(), nid()
+    B.add("Sent Messages", mk(ME, [("Westside Lumber", "hello@westsidelumber.example")], "Plywood order for the gallery build", "Hi, is my plywood order ready?\n\nDavid", D(2024, 3, 10), w1), D(2024, 3, 10))
+    B.add("INBOX", mk(("Westside Lumber", "hello@westsidelumber.example"), [ME], "Re: Plywood order for the gallery build", "Yes, ready for pickup.", D(2024, 3, 11), w2, irt=w1, refs=[w1]), D(2024, 3, 11))
+    B.add("Sent Messages", mk(ME, [("", "unsubscribe@lists.westsidelumber.example")], "unsubscribe", "unsubscribe", D(2024, 3, 12), nid()), D(2024, 3, 12))   # a mailto: unsubscribe click
+    B.add("Sent Messages", mk(ME, [("", "leave-8f3a91c2@leave.e.shopdeals.example")], "", "", D(2024, 3, 12), nid()), D(2024, 3, 12))
+    for i in range(2):   # a bank's sending subdomain, no list headers
+        B.add("INBOX", mk(("Acme Bank", "rewards@mail.acmebank.example"), [ME], f"Your rewards summary {i}", "Points summary.", D(2024, 4, 1 + i), nid()), D(2024, 4, 1 + i))
+    h1, h2 = nid(), nid()   # iCloud Hide-My-Email relays the real sender as name_at_domain_<id>_<id>@icloud.com
+    B.add("INBOX", mk(("Kim Ng", "kim.ng_at_ngstudio_example_qx4k81mn2p7rtz_9fw3c2ab@icloud.com"), [ME], "Lighting rental availability", "Hi David, the lights are free that week.", D(2024, 5, 1), h1), D(2024, 5, 1))
+    B.add("Sent Messages", mk(ME, [("Kim Ng", "kim.ng_at_ngstudio_example_qx4k81mn2p7rtz_9fw3c2ab@icloud.com")], "Re: Lighting rental availability", "Great, booking them.\n\nDavid", D(2024, 5, 2), h2, irt=h1, refs=[h1]), D(2024, 5, 2))
+    guests = [(f"Guest {i}", f"guest{i}@partyguests.example") for i in range(14)]   # a mass email: the other recipients are not contacts
+    B.add("INBOX", mk(("Paul Grant", "paul@grantevents.example"), [ME] + guests, "Holiday party photos", "Photos from the party!", D(2024, 12, 20), nid()), D(2024, 12, 20))
     return B
-FOLDERS = {"INBOX": "", "Sent Messages": "\\Sent", "Sent Items": "", "Archive": "\\Archive", "Archive/Sets and Props Unlimited (imported)": "", "Junk": "\\Junk", "Trash": "\\Trash", "Drafts": "\\Drafts"}
+FOLDERS = {"INBOX": "", "Sent Messages": "\\Sent", "Sent Items": "", "Archive": "\\Archive", "Archive/Sets and Props Unlimited (imported)": "", "Junk": "\\Junk", "Trash": "\\Trash", "Drafts": "\\Drafts",
+           "Bulk orders": "", "Clients": "\\Noselect \\HasChildren", "Clients/M&APw-ller Studio": "\\HasNoChildren"}
+LITERAL_NAMES = {"Clients/M&APw-ller Studio"}   # sent as {n} literals in LIST, like some servers do for names with spaces/specials
 
 # ---------------------------------------------------------------- server
 def bs(m):
@@ -147,11 +188,14 @@ def part(m, path):
         if not cur.is_multipart(): return None
         cur = cur.get_payload()[int(i) - 1]
     return cur
-STATE = {"fetches": 0, "drop_after": None, "dropped": False, "log": None, "violations": []}
+STATE = {"fetches": 0, "drop_after": None, "dropped": False, "log": None, "violations": [], "uidvalidity": {}, "omit_uidvalidity": False,
+         "drop_mid_at": None, "no_uids": set(), "fetch_delay": 0.0}
+def uv(n): return STATE["uidvalidity"].get(n, 1)
 class H(socketserver.StreamRequestHandler):
     def send(s, t): s.wfile.write(t if isinstance(t, bytes) else t.encode("latin-1")); s.wfile.flush()
     def log(s, line):
-        if STATE["log"]: open(STATE["log"], "a").write(line + "\n")
+        if STATE["log"]:
+            with open(STATE["log"], "a") as fh: fh.write(line + "\n")
     def handle(s):
         s.sel = None; s.send("* OK fake imap ready\r\n")
         while True:
@@ -165,14 +209,19 @@ class H(socketserver.StreamRequestHandler):
             elif C == "LOGOUT": s.send(f"* BYE\r\n{tag} OK done\r\n"); return
             elif C == "LIST":
                 out = ""
-                for n, fl in FOLDERS.items(): out += f'* LIST ({fl}) "/" "{n}"\r\n' if " " in n or "/" in n else f'* LIST ({fl}) "/" {n}\r\n'
+                for n, fl in FOLDERS.items():
+                    if n in LITERAL_NAMES: out += f'* LIST ({fl}) "/" {{{len(n)}}}\r\n{n}\r\n'
+                    else: out += f'* LIST ({fl}) "/" "{n}"\r\n' if " " in n or "/" in n else f'* LIST ({fl}) "/" {n}\r\n'
                 s.send(out + f"{tag} OK done\r\n")
             elif C == "STATUS":
-                n = re.match(r'"?([^"]*)"?', args).group(1); msgs = BOX.f.get(n, []); s.send(f'* STATUS "{n}" (MESSAGES {len(msgs)} UIDNEXT {len(msgs)+1} UIDVALIDITY 1)\r\n{tag} OK done\r\n')
+                n = re.match(r'"?([^"]*)"?', args).group(1); msgs = BOX.f.get(n, []); un = sum(1 for m in msgs if "\\Seen" not in m["flags"])
+                s.send(f'* STATUS "{n}" (MESSAGES {len(msgs)} UNSEEN {un} UIDNEXT {len(msgs)+1} UIDVALIDITY {uv(n)})\r\n{tag} OK done\r\n')
             elif C == "EXAMINE":
                 n = re.match(r'"?([^"]*)"?', args).group(1)
                 if n not in BOX.f and n not in FOLDERS: s.send(f"{tag} NO no such folder\r\n"); continue
-                s.sel = n; s.send(f"* {len(BOX.f.get(n, []))} EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-ONLY] examined\r\n")
+                if "\\Noselect" in FOLDERS.get(n, ""): s.send(f"{tag} NO [NONEXISTENT] not selectable\r\n"); continue
+                s.sel = n; uvl = "" if STATE["omit_uidvalidity"] else f"* OK [UIDVALIDITY {uv(n)}] ok\r\n"
+                s.send(f"* {len(BOX.f.get(n, []))} EXISTS\r\n{uvl}{tag} OK [READ-ONLY] examined\r\n")
             elif C == "UID" and args.split(" ", 1)[0].upper() in ("FETCH", "SEARCH"):
                 sub, _, a2 = args.partition(" ")
                 if sub.upper() == "SEARCH": s.search(tag, a2)
@@ -187,6 +236,8 @@ class H(socketserver.StreamRequestHandler):
         def parse():
             t = toks[pos[0]]; pos[0] += 1; T = t.upper()
             if T == "ALL": return lambda m: True
+            if T == "UNSEEN": return lambda m: "\\Seen" not in m["flags"]
+            if T == "SEEN": return lambda m: "\\Seen" in m["flags"]
             if T in ("SINCE", "BEFORE", "SENTSINCE", "SENTBEFORE"):
                 d = pd(toks[pos[0]]); pos[0] += 1
                 def f(m, T=T, d=d):
@@ -222,13 +273,16 @@ class H(socketserver.StreamRequestHandler):
     # --- fetch
     def fetch(s, tag, a2, line):
         spec, _, items = a2.partition(" "); STATE["fetches"] += 1
-        if re.search(r"BODY\[|RFC822(?!\.SIZE)", items.replace("BODY.PEEK[", "BODY.PEEK(")): STATE["violations"].append("non-PEEK fetch: " + line); s.log("VIOLATION non-peek")
+        nonpeek = bool(re.search(r"BODY\[|RFC822(?!\.SIZE)", items.replace("BODY.PEEK[", "BODY.PEEK(")))
+        if nonpeek: STATE["violations"].append("non-PEEK fetch: " + line); s.log("VIOLATION non-peek")
+        if STATE["fetch_delay"]: time.sleep(STATE["fetch_delay"])
         if STATE["drop_after"] and STATE["fetches"] > STATE["drop_after"] and not STATE["dropped"]:
             STATE["dropped"] = True; s.log("INJECTED DISCONNECT"); s.connection.close(); return
         uids = set()
         for p_ in spec.split(","):
             lo, _, hi = p_.partition(":"); uids.update(range(int(lo), int(hi or lo) + 1))
         msgs = {m["uid"]: m for m in BOX.f.get(s.sel, [])}
+        if any((s.sel, u) in STATE["no_uids"] for u in uids): s.log("INJECTED NO"); s.send(f"{tag} NO [UNAVAILABLE] backend unavailable for one message\r\n"); return
         out = b""
         for u in sorted(uids):
             if u not in msgs: continue
@@ -237,7 +291,7 @@ class H(socketserver.StreamRequestHandler):
                 T = tok.group(0)
                 if T == "RFC822.SIZE": pieces.append(f"RFC822.SIZE {len(m['raw'])}".encode())
                 elif T == "INTERNALDATE": pieces.append(f'INTERNALDATE "{idate(m["d"])}"'.encode())
-                elif T == "FLAGS": pieces.append(b"FLAGS (\\Seen)")
+                elif T == "FLAGS": pieces.append(("FLAGS (" + " ".join(sorted(m["flags"])) + ")").encode())
                 elif T == "BODYSTRUCTURE": pieces.append(("BODYSTRUCTURE " + bs(msg)).encode("latin-1", "replace"))
                 else:
                     sec = tok.group(1); hdr, _, body = m["raw"].partition(b"\r\n\r\n") if b"\r\n\r\n" in m["raw"] else m["raw"].partition(b"\n\n")
@@ -245,19 +299,26 @@ class H(socketserver.StreamRequestHandler):
                         want = {x.upper() for x in re.search(r"\(([^)]*)\)", sec).group(1).split()}; lines = re.split(rb"\r?\n(?![ \t])", hdr)
                         data = b"\r\n".join(l for l in lines if l.split(b":")[0].decode("latin-1").upper() in want) + b"\r\n\r\n"
                     elif sec.upper() == "HEADER": data = hdr + b"\r\n\r\n"
+                    elif sec == "1" and not msg.is_multipart(): data = body          # raw bytes, exactly as stored (8-bit Latin-1 stays Latin-1)
                     else:
                         p = part(msg, sec); pl = p.get_payload(decode=False) if p is not None else ""; data = pl.encode("utf-8", "surrogateescape") if isinstance(pl, str) else (pl if isinstance(pl, bytes) else b"")
                     lab = f"BODY[{sec}]"
                     if tok.group(2): a_, b_ = re.findall(r"\d+", tok.group(2)); data = data[int(a_):int(a_) + int(b_)]; lab += f"<{a_}>"
                     pieces.append(lab.encode() + b" {" + str(len(data)).encode() + b"}\r\n" + data)
             out += f"* {seq} FETCH (".encode() + b" ".join(pieces) + b")\r\n"
+            if nonpeek: m["flags"].add("\\Seen")       # what a real server does on BODY[] / RFC822: the audit must catch it
+        if STATE["drop_mid_at"] and STATE["fetches"] == STATE["drop_mid_at"] and len(out) > 40:
+            s.log("INJECTED MID-FETCH DISCONNECT"); s.send(out[:len(out) // 2]); s.connection.close(); return
         s.send(out + f"{tag} OK done\r\n".encode())
 BOX = None
 class Srv(socketserver.ThreadingTCPServer): allow_reuse_address = True; daemon_threads = True
-def serve(port, drop_after=None, log=None):
-    global BOX; BOX = build(); STATE.update(drop_after=drop_after, log=log)
-    if log: open(log, "w").close()
-    srv = Srv(("127.0.0.1", port), H); print(f"fake imap on 127.0.0.1:{port} - {sum(len(v) for v in BOX.f.values())} messages in {len(BOX.f)} folders", flush=True); return srv
+def serve(port, drop_after=None, log=None, quiet=False):
+    global BOX; BOX = build(); STATE.update(drop_after=drop_after, log=log, fetches=0, dropped=False, violations=[], uidvalidity={}, omit_uidvalidity=False, drop_mid_at=None, no_uids=set(), fetch_delay=0.0)
+    if log:
+        with open(log, "w"): pass
+    srv = Srv(("127.0.0.1", port), H)
+    if not quiet: print(f"fake imap on 127.0.0.1:{srv.server_address[1]} - {sum(len(v) for v in BOX.f.values())} messages in {len(BOX.f)} folders", flush=True)
+    return srv
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("serve"); ap.add_argument("--port", type=int, default=1143); ap.add_argument("--drop-after", type=int); ap.add_argument("--log", default="imap-commands.log")
     a = ap.parse_args(); serve(a.port, a.drop_after, a.log).serve_forever()

@@ -1,0 +1,27 @@
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit + end-to-end tests (stdlib unittest, synthetic mailbox, no network)
+        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+      - name: Demo script from a fresh clone
+        run: tests/run_demo.sh "$RUNNER_TEMP/demo-out"
+      - name: Production artifact checksums (pin these in the bot skill)
+        run: |
+          for f in dcrmine.py; do printf '%s  bytes=%s\n' "$(sha256sum "$f")" "$(wc -c < "$f")"; done

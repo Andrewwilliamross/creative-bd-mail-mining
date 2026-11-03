@@ -1,0 +1,36 @@
+[
+  {
+    "slug": "annual-rookie-trophy",
+    "name": "Annual Rookie of the Year Trophy",
+    "type": "Event/activation",
+    "recurring": true,
+    "terms": ["rookie of the year", "roy trophy"],
+    "require_any": ["trophy"],
+    "people": ["maria.lopez"],
+    "domains": [],
+    "title_terms": ["rookie of the year trophy"],
+    "note": "Fictional example: a yearly trophy commission. One child page per year."
+  },
+  {
+    "slug": "halo-summer-launch",
+    "name": "Halo Beverages Summer Launch Backdrop",
+    "type": "Commercial",
+    "recurring": false,
+    "terms": ["halo summer launch", "summer launch backdrop"],
+    "require_any": ["backdrop"],
+    "people": ["dana moore"],
+    "domains": ["halobev-demo.example"],
+    "note": "Fictional example: a one-off job that came through a contact who changed employers."
+  },
+  {
+    "slug": "spark-pictures-archive",
+    "name": "Spark Pictures Sets (imported archive)",
+    "type": "Commercial",
+    "recurring": false,
+    "terms": ["sparkpictures-demo.example"],
+    "require_any": ["set"],
+    "people": ["ray hollis"],
+    "domains": ["sparkpictures-demo.example"],
+    "note": "Fictional example: 1998-2003 mail that arrived via an mbox import (Date header differs from INTERNALDATE)."
+  }
+]
