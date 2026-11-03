@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
-"""dcrmine - READ-ONLY deep mailbox miner (stdlib only).  Stages:
- survey -> approve-survey -> crawl -> filter -> fetch -> thread -> link -> classify -> export   (or: run)
-Mail safety: EXAMINE (readonly) only; FETCH uses BODY.PEEK only; commands limited to LIST/STATUS/EXAMINE/SEARCH/FETCH.
-Secrets: password only from env (default ICLOUD_APP_PASSWORD); never printed or stored."""
-import argparse, base64, collections, csv, datetime as dt, email, email.utils, hashlib, html, imaplib, json, os, quopri
-import re, socket, sqlite3, ssl, sys, time, urllib.error, urllib.request
+"""dcrmine - READ-ONLY deep mailbox miner (stdlib only, Python 3.9+).  Stages:
+ survey -> approve-survey -> crawl -> filter -> fetch -> thread -> link (contacts) -> projects -> export   (or: run)
+Extraction only: unique contacts, the threads they are in, and the projects those threads form. No scoring.
+Bot tools (read the SQLite only, never the mailbox): status, show, search, decisions, voice; decide records triage; bounces lists dead addresses.
+Mail safety: every IMAP command passes a wire-level allow-list (CAPABILITY LOGIN LIST STATUS EXAMINE UID SEARCH/FETCH NOOP LOGOUT);
+folders are opened with EXAMINE only; FETCH may only use BODY.PEEK / BODYSTRUCTURE / headers / sizes / dates / flags.
+Secrets: password only from env (default ICLOUD_APP_PASSWORD); never printed or stored.  All dates are written in UTC."""
+import argparse, base64, codecs, collections, csv, datetime as dt, email, email.utils, hashlib, imaplib, json, os, quopri
+import pathlib, re, socket, sqlite3, ssl, sys, time, unicodedata
 from email.header import decode_header, make_header
 from html.parser import HTMLParser
+try: import fcntl
+except ImportError: fcntl = None   # non-POSIX: run lock disabled
 
-VERSION = "1.0"
-NOW = time.time(); THIS_YEAR = dt.datetime.now().year
-def log(*a): print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
+VERSION = "2.0"
+NOW = time.time(); THIS_YEAR = dt.datetime.now(dt.timezone.utc).year
+imaplib._MAXLINE = 64 * 1024 * 1024   # stdlib default (1 MB) breaks UID SEARCH on folders with >~140k messages
+def utcnow(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def log(*a): print(time.strftime("%H:%M:%SZ", time.gmtime()), *a, file=sys.stderr, flush=True)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
@@ -23,25 +30,105 @@ CREATE TABLE IF NOT EXISTS senders(addr TEXT PRIMARY KEY, name TEXT, domain TEXT
 CREATE TABLE IF NOT EXISTS bodies(mid INTEGER PRIMARY KEY, text TEXT, quoted TEXT, sig TEXT, trunc INTEGER);
 CREATE TABLE IF NOT EXISTS sigs(mid INTEGER, addr TEXT, name TEXT, title TEXT, company TEXT, phone TEXT, site TEXT, ts INTEGER);
 CREATE TABLE IF NOT EXISTS threads(id INTEGER PRIMARY KEY, subj TEXT, first_ts INTEGER, last_ts INTEGER, n INTEGER, people TEXT);
-CREATE TABLE IF NOT EXISTS people(id INTEGER PRIMARY KEY, name TEXT, emails TEXT, org_id INTEGER, title TEXT, phone TEXT, first_ts INTEGER, last_ts INTEGER, n_in INTEGER, n_out INTEGER, last_two_way INTEGER, prev_orgs TEXT, moved INTEGER DEFAULT 0, merged_by TEXT);
-CREATE TABLE IF NOT EXISTS email_person(addr TEXT PRIMARY KEY, pid INTEGER);
-CREATE TABLE IF NOT EXISTS orgs(id INTEGER PRIMARY KEY, key TEXT UNIQUE, name TEXT, domains TEXT, site TEXT, segment TEXT, market TEXT, first_ts INTEGER, last_ts INTEGER, n INTEGER, icp_signal TEXT);
-CREATE TABLE IF NOT EXISTS person_org(pid INTEGER, oid INTEGER, title TEXT, first_ts INTEGER, last_ts INTEGER, n INTEGER, PRIMARY KEY(pid,oid));
-CREATE TABLE IF NOT EXISTS tclass(tid INTEGER, backend TEXT, hash TEXT, pv TEXT, js TEXT, ts REAL, PRIMARY KEY(tid,backend));
+CREATE TABLE IF NOT EXISTS contacts(addr TEXT PRIMARY KEY, name TEXT, name_src TEXT, company TEXT, title TEXT, phone TEXT, domain TEXT, first_ts INTEGER, last_ts INTEGER, n_from INTEGER, n_to INTEGER, n_threads INTEGER);
+CREATE TABLE IF NOT EXISTS thread_contacts(tid INTEGER, addr TEXT, PRIMARY KEY(tid, addr));
+CREATE INDEX IF NOT EXISTS ix_tc_addr ON thread_contacts(addr);
+CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY, name TEXT, first_ts INTEGER, last_ts INTEGER, n_threads INTEGER, n_msgs INTEGER, contacts TEXT, why TEXT);
+CREATE TABLE IF NOT EXISTS project_threads(pid INTEGER, tid INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS survey_cache(k TEXT PRIMARY KEY, v TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS crawl_skips(folder TEXT, uid INTEGER, uidvalidity INTEGER, tries INTEGER, why TEXT, ts REAL, PRIMARY KEY(folder,uid));
+CREATE INDEX IF NOT EXISTS ix_msg_folder ON messages(folder, uid); CREATE INDEX IF NOT EXISTS ix_msg_decision ON messages(decision);
+CREATE INDEX IF NOT EXISTS ix_sigs_addr ON sigs(addr);
+CREATE TABLE IF NOT EXISTS decisions(kind TEXT, key TEXT, decision TEXT, role TEXT, note TEXT, evidence TEXT, ts INTEGER, PRIMARY KEY(kind, key));
+CREATE TABLE IF NOT EXISTS trade(mid INTEGER, tid INTEGER, actor TEXT, act TEXT, what TEXT, counterpart TEXT, PRIMARY KEY(mid, actor, act, counterpart));
+CREATE INDEX IF NOT EXISTS ix_trade_tid ON trade(tid);
+CREATE TABLE IF NOT EXISTS bounces(mid INTEGER, addr TEXT, ts INTEGER, hard INTEGER, status TEXT, reason TEXT, orig_subject TEXT, how TEXT, PRIMARY KEY(mid, addr));
 """
+MIGRATIONS = [("folders", "is_junk", "INTEGER DEFAULT 0"), ("folders", "crit", "TEXT"), ("contacts", "kind", "TEXT DEFAULT 'person'")]
 def opendb(path):
-    db = sqlite3.connect(path); db.row_factory = sqlite3.Row
-    db.executescript(SCHEMA); return db
+    d = os.path.dirname(os.path.abspath(path)); os.makedirs(d, exist_ok=True)
+    db = sqlite3.connect(path, timeout=60); db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=60000")
+    try: db.execute("PRAGMA journal_mode=WAL")   # lets `status` read while a long stage writes
+    except sqlite3.DatabaseError: pass
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.executescript(SCHEMA)
+    for t, col, decl in MIGRATIONS:
+        if col not in {r[1] for r in db.execute(f"pragma table_info({t})")}: db.execute(f"alter table {t} add column {col} {decl}")
+    db.commit(); return db
+class RunLock:
+    """One writer at a time per database: re-running a stage while an old nohup copy is still alive must not corrupt progress."""
+    def __init__(s, dbpath): s.path = os.path.abspath(dbpath) + ".lock"; s.fh = None
+    def __enter__(s):
+        os.makedirs(os.path.dirname(s.path), exist_ok=True)      # fresh --db directory: the lock file is the first thing created
+        if fcntl is None: return s
+        s.fh = open(s.path, "a+")
+        try: fcntl.flock(s.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            s.fh.seek(0); who = s.fh.read().strip()
+            raise SystemExit(f"another dcrmine process is already working on this database ({who or 'pid unknown'}); "
+                             "wait for it to finish (check `status`) or kill it, then re-run this command - it resumes where it stopped.")
+        s.fh.seek(0); s.fh.truncate(); s.fh.write(f"pid {os.getpid()} since {utcnow()}"); s.fh.flush(); return s
+    def __exit__(s, *e):
+        if s.fh:
+            try: s.fh.seek(0); s.fh.truncate(); fcntl.flock(s.fh, fcntl.LOCK_UN); s.fh.close()
+            except Exception: pass
+def lock_holder(dbpath):
+    p = os.path.abspath(dbpath) + ".lock"
+    if fcntl is None or not os.path.exists(p): return ""
+    with open(p, "a+") as fh:
+        try: fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB); fcntl.flock(fh, fcntl.LOCK_UN); return ""
+        except OSError: fh.seek(0); return fh.read().strip() or "running"
 def meta_get(db, k, d=None):
     r = db.execute("select v from meta where k=?", (k,)).fetchone(); return r[0] if r else d
 def meta_set(db, k, v):
     db.execute("insert or replace into meta values(?,?)", (k, v)); db.commit()
+def stage(db, name, state, note=""):
+    """progress breadcrumbs for `status`: stage:<name> = '<state> <utc time> <note>'"""
+    meta_set(db, "stage:" + name, f"{state} {utcnow()} {note}".strip()); meta_set(db, "stage:current", f"{name} {state} {utcnow()}")
 
 # ---------------------------------------------------------------- text helpers
+CHARSET_ALIASES = {"unknown-8bit": "windows-1252", "x-unknown": "windows-1252", "unknown": "windows-1252", "iso-8859-8-i": "iso-8859-8", "x-user-defined": "windows-1252",
+                   "ks_c_5601-1987": "cp949", "x-mac-roman": "mac-roman", "macintosh": "mac-roman", "us-ascii": "ascii", "ansi_x3.4-1968": "ascii", "utf8": "utf-8", "x-sjis": "shift_jis", "gb2312": "gbk"}
+def norm_charset(cs):
+    cs = (cs or "").strip().strip('"\'').lower()
+    if not cs: return ""
+    cs = CHARSET_ALIASES.get(cs, cs)
+    try: return codecs.lookup(cs).name
+    except LookupError: return ""
+def decode_bytes(raw, *charsets, truncated=False):
+    """Best-effort bytes -> str for old mail: declared charset, then utf-8, then windows-1252.
+    truncated=True (a capped partial fetch) tolerates a multibyte character cut off at the very end."""
+    if isinstance(raw, str): return raw
+    raw = raw or b""
+    for cs in [norm_charset(c) for c in charsets if c] + ["utf-8", "windows-1252"]:
+        if not cs: continue
+        try: return raw.decode(cs)
+        except UnicodeDecodeError as e:
+            if truncated and cs == "utf-8" and e.start >= len(raw) - 3 and e.reason == "unexpected end of data":
+                try: return raw[:e.start].decode(cs)
+                except UnicodeDecodeError: pass
+        except LookupError: continue
+    return raw.decode("latin-1", "replace")
 def dh(v):
+    """RFC 2047 header -> clean one-line str. Unknown/broken charsets fall back per encoded word instead of leaving =?...?= garbage."""
     if v is None: return ""
-    try: return str(make_header(decode_header(str(v)))).replace("\r", "").replace("\n", " ").strip()
-    except Exception: return re.sub(r"\s+", " ", str(v)).strip()
+    v = str(v)
+    if any("\udc80" <= ch <= "\udcff" for ch in v):    # surrogateescaped raw 8-bit from the email package
+        try: v = decode_bytes(v.encode("utf-8", "surrogateescape"))
+        except UnicodeError: v = v.encode("utf-8", "replace").decode("utf-8")
+    # decode each encoded word ourselves: make_header() turns unknown charsets (unknown-8bit, x-unknown, bogus names) into U+FFFD without raising
+    try: out = "".join(decode_bytes(b, c) if isinstance(b, bytes) else b for b, c in decode_header(v))
+    except Exception:
+        try: out = str(make_header(decode_header(v)))
+        except Exception: out = v
+    return re.sub(r"\s+", " ", out.replace("\r", "").replace("\n", " ")).strip()
+def header_text(hb):
+    """raw header bytes -> str. 8-bit headers (common before ~2005) are decoded as utf-8, else windows-1252, never with U+FFFD."""
+    return decode_bytes(hb or b"")
+def to_ascii(t):
+    """IMAP SEARCH args go out as ASCII; transliterate accents (Café -> Cafe) rather than crash."""
+    return unicodedata.normalize("NFKD", t).encode("ascii", "ignore").decode()
 def utf7d(s):
     def rep(m):
         t = m.group(1)
@@ -58,13 +145,19 @@ def norm_name(n):
 def name_key(n):
     t = re.sub(r"[^a-z ]", "", norm_name(n).lower()).split()
     return " ".join(t) if len(t) >= 2 and "@" not in n else ""
+HME_RELAY = re.compile(r"^(.+?)_at_([a-z0-9][a-z0-9_\-]*?)_[a-z0-9]{8,}_[a-z0-9]{6,}@(?:icloud\.com|privaterelay\.appleid\.com)$")
+def real_addr(ad):
+    """iCloud Hide-My-Email (and Sign in with Apple) delivers mail from 'jo.smith@acme.com' as 'jo.smith_at_acme_com_<id>_<id>@icloud.com'; undo that"""
+    m = HME_RELAY.match(ad or "")
+    return f"{m.group(1)}@{m.group(2).replace('_', '.')}" if m else ad
 def parse_addrs(v):
     out = []
     for nm, ad in email.utils.getaddresses([dh(v)] if v else []):
-        ad = (ad or "").strip().lower()
+        ad = real_addr((ad or "").strip().lower())
         if "@" in ad and " " not in ad: out.append((ad, norm_name(nm)))
     return out
-FREE = set("gmail.com googlemail.com yahoo.com ymail.com aol.com hotmail.com outlook.com live.com msn.com icloud.com me.com mac.com comcast.net att.net sbcglobal.net earthlink.net verizon.net bellsouth.net cox.net charter.net protonmail.com proton.me gmx.com mail.com juno.com netscape.net roadrunner.com rocketmail.com".split())
+FREE = set("gmail.com googlemail.com yahoo.com ymail.com aol.com hotmail.com outlook.com live.com msn.com icloud.com me.com mac.com comcast.net att.net sbcglobal.net earthlink.net verizon.net bellsouth.net cox.net charter.net protonmail.com proton.me pm.me fastmail.com fastmail.fm hey.com zoho.com tutanota.com yandex.com rr.com gmx.com mail.com juno.com netscape.net roadrunner.com rocketmail.com".split())
+FREE_STEM = set("gmail googlemail hotmail ymail rocketmail protonmail fastmail zohomail gmx yahoo mail email aol outlook live msn".split())   # hotmail.co.uk etc.
 SLD2 = {"co.uk", "com.au", "co.nz", "co.jp", "com.br", "org.uk", "ac.uk"}
 def reg_domain(d):
     p = d.lower().split(".")
@@ -82,8 +175,29 @@ def ymd(ts): return time.strftime("%Y-%m-%d", time.gmtime(ts)) if ts else ""
 def year_of(ts): return time.gmtime(ts).tm_year if ts else 0
 
 # ---------------------------------------------------------------- noise heuristics
-ESP = set("""mailchimp.com mcsv.net mcdlv.net rsgsv.net sendgrid.net sendgrid.com constantcontact.com ccsend.com rs6.net mailgun.org mailgun.com amazonses.com sparkpostmail.com sparkpost.com hubspot.com hubspotemail.net hs-send.com klaviyo.com klaviyomail.com exacttarget.com et.com salesforce.com marketo.com mktomail.com campaign-archive.com createsend.com cmail19.com cmail20.com campaignmonitor.com mandrillapp.com mailjet.com sendinblue.com brevo.com convertkit.com substack.com beehiiv.com eventbrite.com e.eventbrite.com linkedin.com facebookmail.com twitter.com x.com pinterest.com instagram.com quora.com meetup.com nextdoor.com youtube.com paypal.com ebay.com etsy.com shopify.com squarespace.com wix.com godaddy.com groupon.com zoom.us docusign.net""".split())
+ESP = set("""mailchimp.com mcsv.net mcdlv.net rsgsv.net sendgrid.net sendgrid.com constantcontact.com ccsend.com rs6.net mailgun.org mailgun.com amazonses.com sparkpostmail.com sparkpost.com hubspot.com hubspotemail.net hs-send.com klaviyo.com klaviyomail.com exacttarget.com et.com salesforce.com marketo.com mktomail.com campaign-archive.com createsend.com cmail19.com cmail20.com campaignmonitor.com mandrillapp.com mailjet.com sendinblue.com brevo.com convertkit.com substack.com beehiiv.com eventbrite.com e.eventbrite.com linkedin.com facebookmail.com twitter.com x.com pinterest.com instagram.com quora.com meetup.com nextdoor.com youtube.com paypal.com ebay.com etsy.com shopify.com squarespace.com wix.com godaddy.com groupon.com zoom.us docusign.net myworkday.com intercom-mail.com intercom.io zendesk.com freshdesk.com helpdesk.com customeremailnotifications.com""".split())
 NOISE_LOCAL = re.compile(r"^(no[-_.]?reply|do[-_.]?not[-_.]?reply|donotreply|noreply|notifications?|notify|alerts?|newsletter|news|mailer[-_.]?daemon|postmaster|bounce[sd]?|bounces?|updates?|marketing|promo(tions?)?|offers?|deals?|info@|billing|receipts?|orders?|support|customerservice|automated|system|auto[-_.]?reply)\b", re.I)
+NOREPLY_ANY = re.compile(r"no[-_.]?reply|do[-_.]?not[-_.]?reply|donotreply|mailer[-_.]?daemon|^robot\b|^bounce", re.I)
+LISTCMD_LOCAL = re.compile(r"(^|[-_.+])(unsubscribe|unsub|listunsubscribe|leave|optout|opt-out|remove)([-_.+]|$)|-request$", re.I)
+LISTCMD_SUBJ = re.compile(r"^\s*(unsubscribe|unsub|remove me|stop|opt[- ]?out)\b", re.I)
+BULK_LABEL = re.compile(r"^(e\d*|em\d*|eg|cm|mc|m|t|go|mg|mail\w*|\w+mail|emails?|news\w*|communications?|comms|marketing|mktg|\w*notifications?|alerts?|highlights|\w*updates|offers|promo\w*|info|reply|replies|send|txn|engage|leave|unsub\w*|bounces?|digitalshopcard|workflow|orders?|care|customer\w*|service|ticketing|app|property|tickets)$", re.I)
+BULK_REG = re.compile(r"(^|[-.])e?mails?[-.]|\we?mail\.|-mail\.", re.I)
+SHARED_LOCAL = re.compile(r"^(info|hello|hi|hey|team|support|assistance|help|helpdesk|service|services|care|customercare|customerservice|guestservices|concierge|contact|contactus|membership|members|reservations?|rsvp|events?|office|sales|press|media|admin|accounts?|accounting|billing|booking|bookings|orders?|hr|jobs|careers|recruiting|talent|enquiries|inquiries|enquiry|inquiry|feedback|community|partners?|partnerships|marketing|studio|general|mail|email|ar|ap|payments|leasing|sell|shop|store|webmaster|legal|privacy|security|newsroom|ops|operations|confirmations?|itinerary|boardingpass|identification|forms|tickets|groups|inquire|alumni|management|mgmt|guestrelations|visitorservices|\w*feedback|\w*support|\w*info|\w*services?|\w*notifications?|\w*marketing\d*|printandgo)(?:[-_.+]\w*)?$", re.I)
+def is_listcmd(ad):
+    loc, _, dom = (ad or "").partition("@")
+    return bool(LISTCMD_LOCAL.search(loc) or re.search(r"(^|\.)(unsub\w*|leave)\.", dom))
+def is_bulk_domain(ad):
+    """mail.x.com / e.x.com / news.x.com style sending subdomains, and x-mail.com style sending domains"""
+    dom = (ad or "").partition("@")[2]; reg = reg_domain(dom)
+    if reg in FREE: return False
+    subs = dom[:-len(reg)].strip(".").split(".") if dom != reg else []
+    return any(BULK_LABEL.match(x) for x in subs if x) or (reg.split(".")[0] not in FREE_STEM and bool(BULK_REG.search(reg)))
+def is_shared_inbox(ad): return bool(SHARED_LOCAL.match((ad or "").partition("@")[0]))
+def is_automated(ad):
+    loc = (ad or "").partition("@")[0]
+    if len(loc) > 40 or re.match(r"^\d{6,}[-+.]", loc): return True          # per-message relay / ticket ids
+    return bool(NOISE_LOCAL.match(loc + ("@" if loc == "info" else "")) or NOREPLY_ANY.search(loc) or is_listcmd(ad) or is_bulk_domain(ad)
+                or reg_domain(ad.partition("@")[2]) in ESP or ad.endswith("@privaterelay.appleid.com"))
 SUBJ_NOISE = re.compile(r"(\d+\s?% off|\bsale\b|free shipping|newsletter|unsubscribe|webinar|your (order|receipt|statement|subscription|password)|has shipped|order confirmation|special offer|limited time|last chance|digest|weekly update|verify your|security alert|promo code|coupon|you'?re invited|rsvp|e-?receipt)", re.I)
 SUBJ_PROJECT = re.compile(r"(quote|estimate|invoice|\bpo\b|purchase order|deposit|call sheet|render|set design|build|load[- ]?in|strike|trophy|bid\b|budget|fabricat|mock-?up|drawings?|floor ?plan|mood ?board|shoot|prop|backdrop|install|sketch|proposal)", re.I)
 PROJECT_ATT = re.compile(r"\.(pdf|xlsx?|docx?|jpe?g|png|tiff?|psd|ai|dwg|dxf|skp|3dm|rvt|indd|mov|mp4|zip)$", re.I)
@@ -98,14 +212,49 @@ def noise_hints(h):
     fa = parse_addrs(h.get("From", ""))
     if fa:
         ad = fa[0][0]; loc, dom = ad.split("@")[0], ad.split("@")[1]
-        if NOISE_LOCAL.match(loc + ("@" if loc == "info" else "")): hs.append("noreply-local")
+        if NOISE_LOCAL.match(loc + ("@" if loc == "info" else "")) or NOREPLY_ANY.search(loc): hs.append("noreply-local")
         if reg_domain(dom) in ESP or dom in ESP: hs.append("esp-domain")
     return (1 if hs else 0), hs
 
-# ---------------------------------------------------------------- IMAP layer (read-only)
+# ---------------------------------------------------------------- IMAP layer (read-only, enforced at the wire)
+READONLY_VERBS = {"CAPABILITY", "LOGIN", "LIST", "STATUS", "EXAMINE", "UID", "NOOP", "LOGOUT"}
+READONLY_UID = {"FETCH", "SEARCH"}
+NONPEEK = re.compile(r"BODY\[|BINARY\[|RFC822(?!\.SIZE)")
+class ReadOnlyViolation(AssertionError): pass
+class UidValidityChanged(Exception): pass
+def check_fetch_items(items):
+    if NONPEEK.search(str(items).upper().replace("BODY.PEEK[", "PEEK(").replace("BINARY.PEEK[", "PEEK(")):
+        raise ReadOnlyViolation(f"non-PEEK fetch refused (would set \\Seen): {str(items)[:120]}")
+def check_command(name, args):
+    """Called for every command imaplib is about to send. Anything that could change the mailbox raises before it reaches the server."""
+    n = str(name).upper(); a = [x.decode("latin-1") if isinstance(x, bytes) else str(x) for x in args if x is not None]
+    if n not in READONLY_VERBS: raise ReadOnlyViolation(f"IMAP command {n} refused (read-only miner)")
+    if n == "UID":
+        sub = a[0].upper() if a else ""
+        if sub not in READONLY_UID: raise ReadOnlyViolation(f"UID {sub} refused (read-only miner)")
+        if sub == "FETCH": check_fetch_items(" ".join(a[2:]))
+IMAP_AUDIT = None   # tests set this to a list to record every command sent
+class _Guard:
+    def _command(self, name, *args):
+        try: check_command(name, args)
+        except ReadOnlyViolation:
+            self.literal = None          # e.g. a refused APPEND leaves imaplib's pending literal set; never let it ride on the next command
+            raise
+        if IMAP_AUDIT is not None: IMAP_AUDIT.append(" ".join([str(name)] + ["***" if str(name).upper() == "LOGIN" and i == 1 else (x.decode("latin-1") if isinstance(x, bytes) else str(x)) for i, x in enumerate(args) if x is not None]))
+        return super()._command(name, *args)
+class GuardedIMAP4(_Guard, imaplib.IMAP4): pass
+class GuardedIMAP4_SSL(_Guard, imaplib.IMAP4_SSL): pass
+TRANSIENT_NO = re.compile(r"UNAVAILABLE|THROTTL|TRY ?AGAIN|LIMIT|TOO MANY|SERVERBUG|INUSE|TEMPORAR|BUSY|OVERQUOTA|EXPUNGEISSUED", re.I)
+def uid_set(uids):
+    """[1,2,3,7,9,10] -> '1:3,7,9:10' (keeps FETCH command lines short)"""
+    u = sorted(set(uids)); out = []; i = 0
+    while i < len(u):
+        j = i
+        while j + 1 < len(u) and u[j + 1] == u[j] + 1: j += 1
+        out.append(str(u[i]) if i == j else f"{u[i]}:{u[j]}"); i = j + 1
+    return ",".join(out)
 class Conn:
-    ALLOWED_UID = {"FETCH", "SEARCH"}
-    def __init__(s, a): s.a = a; s.m = None; s.folder = None
+    def __init__(s, a): s.a = a; s.m = None; s.folder = None; s.uv = {}; s.reconnects = 0; s.no_responses = 0
     def connect(s):
         a = s.a
         if s.m:
@@ -114,9 +263,14 @@ class Conn:
         s.m = None
         pw = os.environ.get(a.pass_env, "")
         if not a.user or not pw: raise SystemExit(f"Set --user (or DCR_IMAP_USER) and env {a.pass_env} (app-specific password).")
-        m = imaplib.IMAP4(a.host, a.port, timeout=a.timeout) if a.plain else imaplib.IMAP4_SSL(a.host, a.port, ssl_context=ssl.create_default_context(), timeout=a.timeout)
-        m.login(a.user, pw); s.m = m
-        if s.folder: s.select(s.folder, retry=False)
+        m = GuardedIMAP4(a.host, a.port, timeout=a.timeout) if a.plain else GuardedIMAP4_SSL(a.host, a.port, ssl_context=ssl.create_default_context(), timeout=a.timeout)
+        try: m.login(a.user, pw)
+        except imaplib.IMAP4.error as e:
+            raise SystemExit(f"IMAP login refused for {a.user.split('@')[-1]} account: {str(e)[:120]}. Check DCR_IMAP_USER and that {a.pass_env} is an Apple app-specific password.")
+        s.m = m
+        if s.folder:
+            old = s.uv.get(s.folder); s._examine(s.folder)
+            if old and s.uv.get(s.folder) and s.uv[s.folder] != old: raise UidValidityChanged(s.folder)
     def retry(s, fn, retries=8):
         delay = 2
         for i in range(retries):
@@ -124,30 +278,57 @@ class Conn:
                 if s.m is None: s.connect()
                 return fn(s.m)
             except (imaplib.IMAP4.abort, ConnectionError, socket.timeout, ssl.SSLError, OSError, EOFError) as e:
-                log(f"IMAP link problem ({type(e).__name__}: {str(e)[:80]}); reconnect in {delay}s ({i+1}/{retries})")
-                s.m = None; time.sleep(delay); delay = min(delay * 2, 120)
-        raise RuntimeError("IMAP: giving up after repeated disconnects (progress is checkpointed; re-run to resume)")
+                why = f"{type(e).__name__}: {str(e)[:80]}"
+            except imaplib.IMAP4.error as e:     # BAD/NO raised as error: only retry the server-side "come back later" kinds
+                if not TRANSIENT_NO.search(str(e)): raise
+                why = f"server busy: {str(e)[:80]}"
+            s.reconnects += 1
+            log(f"IMAP link problem ({why}); reconnect in {delay}s ({i+1}/{retries})")
+            try:
+                if s.m: s.m.shutdown()
+            except Exception: pass
+            s.m = None; time.sleep(delay); delay = min(delay * 2, 120)
+        raise RuntimeError("IMAP: giving up after repeated disconnects (progress is checkpointed; re-run the same command to resume)")
     @staticmethod
     def q(name): return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    def select(s, name, retry=True):
-        fn = lambda m: m.select(s.q(name), readonly=True)   # EXAMINE: server cannot change flags
-        typ, d = s.retry(fn) if retry else fn(s.m)
+    def _examine(s, name):
+        typ, d = s.m.select(s.q(name), readonly=True)   # imaplib sends EXAMINE: the server cannot change flags
         if typ != "OK": raise ValueError(f"cannot examine {name}: {d}")
-        s.folder = name; return d
+        _, v = s.m.response("UIDVALIDITY")
+        try: s.uv[name] = int(v[0]) if v and v[0] else s.uv.get(name, 0)
+        except (TypeError, ValueError): pass
+        return d
+    def select(s, name, retry=True):
+        s.folder = name
+        d = s.retry(lambda m: s._examine(name)) if retry else s._examine(name)
+        return d
     def list(s):
         typ, d = s.retry(lambda m: m.list()); return d
     def status(s, name, items):
         typ, d = s.retry(lambda m: m.status(s.q(name), items)); return d
+    def status_counts(s, name, items="(MESSAGES UNSEEN UIDNEXT UIDVALIDITY)"):
+        st = " ".join(x.decode("latin-1") if isinstance(x, bytes) else str(x) for x in (s.status(name, items) or []) if x is not None)
+        return {k: int(v) for k, v in re.findall(r"(MESSAGES|UNSEEN|UIDNEXT|UIDVALIDITY|RECENT) (\d+)", st)}
     def uidvalidity(s):
-        typ, d = s.retry(lambda m: m.response("UIDVALIDITY")); return int(d[0]) if d and d[0] else 0
+        uv = s.uv.get(s.folder, 0)
+        if not uv and s.folder: uv = s.status_counts(s.folder, "(UIDVALIDITY)").get("UIDVALIDITY", 0)
+        return uv
     def search(s, *crit, retries=8):
         typ, d = s.retry(lambda m: m.uid("SEARCH", *crit), retries)
-        return [int(x) for x in (d[0] or b"").split()] if typ == "OK" and d and d[0] else []
-    def fetch(s, uids, items, retries=8):
-        if re.search(r"BODY\[|RFC822(?!\.SIZE)|BINARY\[(?!.*PEEK)", items.replace("PEEK[", "PEEK(")):
-            raise AssertionError("non-PEEK fetch refused (would set \\Seen)")
-        typ, d = s.retry(lambda m: m.uid("FETCH", ",".join(map(str, uids)), items), retries)
-        return parse_fetch(d) if typ == "OK" else {}
+        if typ != "OK": raise RuntimeError(f"SEARCH {' '.join(map(str, crit))[:60]} refused: {d}")
+        return [int(x) for x in b" ".join(x for x in d if isinstance(x, bytes)).split() if x.isdigit()]
+    def fetch(s, uids, items, retries=8, _split=False):
+        """UID FETCH with bisection: a NO for one bad message (seen on large hosted mailboxes) must not lose its whole batch."""
+        check_fetch_items(items)
+        uids = sorted(set(uids))
+        if not uids: return {}
+        typ, d = s.retry(lambda m: m.uid("FETCH", uid_set(uids), items), retries)
+        if typ == "OK": return parse_fetch(d)
+        s.no_responses += 1; txt = " ".join(x.decode("latin-1", "replace") if isinstance(x, bytes) else str(x) for x in (d or []) if x is not None)[:120]
+        if TRANSIENT_NO.search(txt) and not _split: time.sleep(3)      # back off once per refused batch, not per bisection level
+        if len(uids) == 1: log(f"  FETCH UID {uids[0]} refused by server ({typ} {txt}); recorded, will retry on a later run"); return {}
+        log(f"  FETCH of {len(uids)} messages got {typ} ({txt}); splitting batch")
+        h = len(uids) // 2; out = s.fetch(uids[:h], items, retries, True); out.update(s.fetch(uids[h:], items, retries, True)); return out
 
 def parse_list_line(item):
     lit = None
@@ -164,17 +345,21 @@ def list_folders(c):
     for it in c.list():
         if it is None: continue
         f = parse_list_line(it)
-        if f and "\\noselect" not in f["flags"].lower(): out.append(f)
-    return out
+        if f and not re.search(r"\\(noselect|nonexistent)\b", f["flags"], re.I): out.append(f)
+    seen = set(); return [f for f in out if not (f["name"] in seen or seen.add(f["name"]))]
 def is_sent_folder(f):
     return "\\sent" in f["flags"].lower() or bool(re.search(r"(^|[/.])(sent( (messages|items|mail))?|outbox)$", f["display"], re.I))
 def is_junk_folder(f): return bool(re.search(r"\\(junk|trash)", f["flags"].lower())) or bool(re.search(r"(^|[/.])(junk|spam|trash|deleted( items| messages)?|bulk mail)$", f["display"], re.I))
 def is_drafts_folder(f): return "\\drafts" in f["flags"].lower() or bool(re.search(r"(^|[/.])drafts?$", f["display"], re.I))
 def is_nonmail_folder(f): return bool(re.search(r"(^|[/.])(notes|calendar|contacts|tasks|journal|conversation history|rss.*)$", f["display"], re.I))
 
+LITS = None   # literal payloads referenced as \x00n\x00 markers inside a FETCH response being parsed
 def sexp(s, i=0):
     while s[i] == " ": i += 1
     c = s[i]
+    if c == "\x00":                                   # an IMAP literal (e.g. a non-ASCII filename) inside BODYSTRUCTURE
+        j = s.index("\x00", i + 1); n = int(s[i + 1:j])
+        return (decode_bytes(LITS[n]) if LITS and n < len(LITS) else ""), j + 1
     if c == "(":
         i += 1; L = []
         while True:
@@ -217,8 +402,11 @@ def parse_fetch(data):
             r["sections"][mm.group(1).upper()] = lits[int(mm.group(2))]
         mm = re.search(r"BODYSTRUCTURE ", text)
         if mm:
+            global LITS
+            LITS = lits
             try: r["struct"] = sexp(text, mm.end())[0]
             except Exception: r["struct"] = None
+            finally: LITS = None
         out[r["uid"]] = r
     return out
 def walk_struct(node, path=""):
@@ -250,16 +438,30 @@ def parse_idate(s):
         if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
         return int(d.timestamp())
     except Exception: return None
+def parse_date_header(raw):
+    """-> (ts or None, issue or None). Handles 2-digit years, missing zone (taken as UTC), junk after the zone, and dates like 'Mon, 4 May 1998 10:00 EST'."""
+    raw = re.sub(r"\s+", " ", str(raw)).strip()
+    for cand in (raw, re.sub(r"\s*\([^)]*\)\s*$", "", raw), re.sub(r"^[A-Za-z]{3},?\s*", "", raw)):
+        try:
+            d = email.utils.parsedate_to_datetime(cand)
+            if d is None: continue
+            if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
+            return int(d.timestamp()), None
+        except Exception: continue
+    t = email.utils.parsedate_tz(raw)
+    if t and t[0]:
+        try: return int(email.utils.mktime_tz(t if t[9] is not None else t[:9] + (0,))), None
+        except Exception: pass
+    return None, "bad-date"
 def parse_headers(hb, idate=None):
-    msg = email.message_from_bytes(hb or b""); issues = []
+    issues = []
+    if hb and any(b > 127 for b in hb): issues.append("raw-8bit-header")
+    msg = email.message_from_string(header_text(hb))
     raw_date = msg.get("Date"); ts = None
     if not raw_date: issues.append("no-date")
     else:
-        try:
-            d = email.utils.parsedate_to_datetime(str(raw_date))
-            if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
-            ts = int(d.timestamp())
-        except Exception: issues.append("bad-date")
+        ts, why = parse_date_header(raw_date)
+        if why: issues.append(why)
     idts = parse_idate(idate) if idate else None; date_bad = 0
     if ts is not None and (year_of(ts) < 1980 or ts > NOW + 400 * 86400): issues.append("date-out-of-range"); ts = None
     if ts is None: ts = idts or 0; date_bad = 1
@@ -269,7 +471,6 @@ def parse_headers(hb, idate=None):
         if v:
             try: str(make_header(decode_header(str(v))))
             except Exception: issues.append("header-encoding"); break
-    if hb and any(b > 127 for b in hb): issues.append("raw-8bit-header")
     bulk, hints = noise_hints(msg)
     fr = parse_addrs(msg.get("From", ""))
     subj = dh(msg.get("Subject", ""))
@@ -295,8 +496,7 @@ SURVEY_KW = ["quote", "estimate", "invoice", "purchase order", "PO", "deposit", 
 NOISY_KW = {"po", "set", "build", "strike", "render"}   # SUBJECT search is substring-based; these over-match (e.g. 'offset', 'post')
 DEFAULT_SEEDS = {"Pepsi / Rookie of the Year": ["pepsi", "rookie of the year"], "Paramount": ["paramount"], "Charlie Ward": ["charlie ward"], "NOBL": ["nobl"],
                  "SpongeBob": ["spongebob"], "Street Fighter": ["street fighter"], "Ebenezer": ["ebenezer"]}
-def dstr(y): return f"1-Jan-{y}"
-def qs(x): return '"' + x.replace('"', "") + '"'
+def qs(x): return '"' + to_ascii(x).replace('"', "").replace("\\", "") + '"'
 def window(c, kind, lo, hi):
     p = "SENT" if kind == "sent" else ""
     if lo is None: return set(c.search(f"{p}BEFORE", dstr(hi)))
@@ -326,9 +526,41 @@ def fetch_headers(c, uids, batch=100):
             h = parse_headers(x["sections"].get(f"HEADER.FIELDS ({HDR_FIELDS})", b""), x.get("idate"))
             parts, atts = struct_info(x.get("struct")); h["size"] = int(x.get("size") or 0); h["atts"] = atts; out[u] = h
     return out
-def survey_collect(a):
-    c = Conn(a); t0 = time.time(); S = {"generated": time.strftime("%Y-%m-%d %H:%M"), "host": a.host, "user_domain": (a.user or "").split("@")[-1], "folders": [], "seeds": {}, "keywords": {}, "quirks": []}
-    seeds = json.load(open(a.seeds)) if a.seeds else DEFAULT_SEEDS
+def load_seed_terms(path):
+    """--seeds accepts the list format ([{"name","terms",...}]) or a plain {"name": [terms]} map."""
+    if not path: return DEFAULT_SEEDS
+    with open(path, encoding="utf-8") as fh: js = json.load(fh)
+    if isinstance(js, list): return {x["name"]: list(x["terms"]) for x in js if x.get("terms")}
+    return {k: (v["terms"] if isinstance(v, dict) else list(v)) for k, v in js.items()}
+def survey_accumulate(info, recs, W, selfaddr, sent_corr, recv_from, att_subj):
+    for h in recs:
+        b = band_of(year_of(h["ts"]) if h["ts"] else h["win"]); w = h["w"]; fa = h["from"][0]
+        if info["sent"]:
+            selfaddr[fa] += w
+            if h["from"][1]: W["self_name"][re.sub(r"\s+", " ", h["from"][1].strip().lower())] += w
+            for ad, n in h["to"] + h["cc"]:
+                d = sent_corr.setdefault(ad, {"n": 0.0, "name": n, "years": set(), "first": 9999, "last": 0}); d["n"] += w
+                y = year_of(h["ts"]); d["years"].add(y); d["first"] = min(d["first"], y); d["last"] = max(d["last"], y)
+                if n and not d["name"]: d["name"] = n
+                W["to_dom_" + b][dom_of(ad) or ad] += w
+        elif not (info["junk"] or info["drafts"]):
+            if fa: recv_from[fa] += w; W["from_dom_" + b][dom_of(fa)] += w
+            for ad, n in h["to"] + h["cc"]: W["to_dom_" + b][dom_of(ad)] += w
+        if h["bulk"] and fa: W["noise_dom"][dom_of(fa)] += w
+        if h["atts"] and not h["bulk"]:
+            k = norm_subject(h["subject"])[:80]
+            if k:
+                d = att_subj.setdefault(k, {"n": 0.0, "mb": 0.0, "exts": collections.Counter(), "years": set(), "folder": info["display"]}); d["n"] += w; d["mb"] += w * h["size"] / 1e6
+                d["years"].add(year_of(h["ts"])); d["exts"].update(os.path.splitext(x["name"] or "")[1].lower() or x["type"] for x in h["atts"])
+def survey_collect(a, db=None):
+    c = Conn(a); t0 = time.time(); S = {"generated": utcnow(), "host": a.host, "user_domain": (a.user or "").split("@")[-1], "folders": [], "seeds": {}, "keywords": {}, "quirks": []}
+    seeds = load_seed_terms(a.seeds)
+    for nm_, terms in seeds.items():
+        for t in terms:
+            if to_ascii(t) != t: S["quirks"].append(f"seed term '{nm_}' contains non-ASCII; searched as '{to_ascii(t)}'")
+    cache = (lambda k: (lambda r: json.loads(r[0]) if r else None)(db.execute("select v from survey_cache where k=?", (k,)).fetchone())) if db else (lambda k: None)
+    def cache_put(k, v):
+        if db: db.execute("insert or replace into survey_cache values(?,?,?)", (k, json.dumps(v, default=sorted), time.time())); db.commit()
     kws = [k.strip() for k in a.keywords.split(",")] if a.keywords else SURVEY_KW
     fl = list_folders(c); log(f"survey: {len(fl)} selectable folders")
     W = collections.defaultdict(lambda: collections.defaultdict(float))   # weighted counters
@@ -336,14 +568,21 @@ def survey_collect(a):
     for f in fl:
         nm = f["name"]; info = {"name": nm, "display": f["display"], "flags": f["flags"], "depth": f["display"].count(f["delim"]) if f["delim"] not in ("NIL", "") else 0,
                                 "sent": is_sent_folder(f), "junk": is_junk_folder(f), "drafts": is_drafts_folder(f), "nonmail": is_nonmail_folder(f)}
-        try:
-            st = " ".join(x.decode("latin-1") if isinstance(x, bytes) else str(x) for x in c.status(nm, "(MESSAGES UIDNEXT UIDVALIDITY)"))
-        except Exception as e: st = ""; info["status_error"] = str(e)[:80]
-        g = lambda k: int(m.group(1)) if (m := re.search(k + r" (\d+)", st)) else None
-        info["messages"], info["uidnext"], info["uidvalidity"] = g("MESSAGES"), g("UIDNEXT"), g("UIDVALIDITY")
+        try: st = c.status_counts(nm)
+        except Exception as e: st = {}; info["status_error"] = str(e)[:80]
+        info["messages"], info["unseen"], info["uidnext"], info["uidvalidity"] = st.get("MESSAGES"), st.get("UNSEEN"), st.get("UIDNEXT"), st.get("UIDVALIDITY")
         S["folders"].append(info)
         if not info["messages"] or info["nonmail"]: continue
-        c.select(nm); log(f"survey: {f['display']} ({info['messages']} msgs)")
+        ck = f"folder:{nm}:{info['uidvalidity']}:{info['uidnext']}:{info['messages']}:{a.sample}:{a.sent_sample}"
+        hit = cache(ck)
+        if hit:
+            info.update(hit["info"]); ys = {int(k): set(v) for k, v in hit["ys"].items()}; recs = hit["recs"]
+            log(f"survey: {f['display']} (cached from an earlier interrupted survey)")
+            msgid_sets[nm] = {h["msgid"] for h in recs if h["msgid"]}; folder_data[nm] = (info, recs, ys); survey_accumulate(info, recs, W, selfaddr, sent_corr, recv_from, att_subj); continue
+        try: c.select(nm)
+        except (ValueError, imaplib.IMAP4.error) as e:
+            info["examine_error"] = str(e)[:100]; S["quirks"].append(f"folder '{f['display']}' could not be opened read-only: {str(e)[:80]}"); log(f"survey: cannot EXAMINE {f['display']}: {e}"); continue
+        log(f"survey: {f['display']} ({info['messages']} msgs)")
         ys = folder_years(c, "internal"); info["years_internal"] = {str(y): len(u) for y, u in sorted(ys.items())}
         info["accounted"] = sum(len(u) for u in ys.values())
         allsets = ys; sample_n = K = a.sent_sample if info["sent"] else a.sample
@@ -376,50 +615,46 @@ def survey_collect(a):
         dyr = [y for y in dy if y]; info["first_date_hdr"], info["last_date_hdr"] = (min(dyr), max(dyr)) if dyr else (None, None)
         msgid_sets[nm] = {h["msgid"] for h in recs if h["msgid"]}
         folder_data[nm] = (info, recs, ys)
-        for h in recs:
-            b = band_of(year_of(h["ts"]) if h["ts"] else h["win"]); w = h["w"]; fa = h["from"][0]
-            if info["sent"]:
-                selfaddr[fa] += w
-                for ad, n in h["to"] + h["cc"]:
-                    d = sent_corr.setdefault(ad, {"n": 0.0, "name": n, "years": set(), "first": 9999, "last": 0}); d["n"] += w
-                    y = year_of(h["ts"]); d["years"].add(y); d["first"] = min(d["first"], y); d["last"] = max(d["last"], y)
-                    if n and not d["name"]: d["name"] = n
-                    W["to_dom_" + b][dom_of(ad) or ad] += w
-            elif not (info["junk"] or info["drafts"]):
-                if fa: recv_from[fa] += w; W["from_dom_" + b][dom_of(fa)] += w
-                for ad, n in h["to"] + h["cc"]: W["to_dom_" + b][dom_of(ad)] += w
-            if h["bulk"] and fa: W["noise_dom"][dom_of(fa)] += w
-            if h["atts"] and not h["bulk"]:
-                k = norm_subject(h["subject"])[:80]
-                if k:
-                    d = att_subj.setdefault(k, {"n": 0.0, "mb": 0.0, "exts": collections.Counter(), "years": set(), "folder": info["display"]}); d["n"] += w; d["mb"] += w * h["size"] / 1e6
-                    d["years"].add(year_of(h["ts"])); d["exts"].update(os.path.splitext(x["name"] or "")[1].lower() or x["type"] for x in h["atts"])
+        cache_put(ck, {"info": info, "ys": {str(k): sorted(v) for k, v in ys.items()}, "recs": recs})
+        survey_accumulate(info, recs, W, selfaddr, sent_corr, recv_from, att_subj)
     # keyword + seed searches (server-side SEARCH; no data transfer)
     log("survey: keyword/seed counts")
     searchable = [(i, folder_data[i["name"]]) for i in S["folders"] if i["name"] in folder_data and not (i["junk"] or i["drafts"])]
     for k in kws: S["keywords"][k] = {"total": 0, "by_folder": {}, "noisy": k.lower() in NOISY_KW}
-    seed_hits = {}
+    seed_hits = {}; qkey = hashlib.sha1(json.dumps([kws, seeds, bool(a.no_text_search)], sort_keys=True).encode()).hexdigest()[:12]
     for info, (_i, recs, ys) in searchable:
-        c.select(info["name"]); unions = set().union(*ys.values()) if ys else set()
-        for k in kws:
-            u = set(c.search("SUBJECT", qs(k)))
-            if u: S["keywords"][k]["by_folder"][info["display"]] = len(u); S["keywords"][k]["total"] += len(u)
+        ck = f"search:{info['name']}:{info['uidvalidity']}:{info['uidnext']}:{info['messages']}:{qkey}"; hit = cache(ck)
+        if hit is None:
+            try: c.select(info["name"])
+            except (ValueError, imaplib.IMAP4.error) as e: log(f"survey: cannot EXAMINE {info['display']}: {e}"); continue
+            hit = {"kw": {}, "seeds": {}}; sent_years = None
+            for k in kws:
+                hit["kw"][k] = len(c.search("SUBJECT", qs(k)))
+            for sname, terms in seeds.items():
+                hh, tt = set(), set(); err = ""
+                for t in terms:
+                    hh |= set(c.search("OR", "SUBJECT", qs(t), "OR", "FROM", qs(t), "OR", "TO", qs(t), "CC", qs(t)))
+                    if not a.no_text_search:
+                        try: tt |= set(c.search("TEXT", qs(t), retries=1))
+                        except Exception as e: err = type(e).__name__; c.m = None
+                tt |= hh; by_year = {}
+                if tt:
+                    if info["imported_archive"] and sent_years is None: sent_years = folder_years(c, "sent")
+                    for y, u in (sent_years if info["imported_archive"] else ys).items():
+                        n = len(set(u) & tt)
+                        if n: by_year[str(y)] = n
+                hit["seeds"][sname] = {"hh": len(hh), "tt": sorted(tt), "by_year": by_year, "err": err}
+            cache_put(ck, hit)
+        for k, n in hit["kw"].items():
+            if n: S["keywords"][k]["by_folder"][info["display"]] = n; S["keywords"][k]["total"] += n
         for sname, terms in seeds.items():
             sd = S["seeds"].setdefault(sname, {"terms": terms, "header_hits": 0, "text_hits": 0, "by_folder": {}, "by_year": {}, "contacts": {}, "subjects": []})
-            hh, tt = set(), set()
-            for t in terms:
-                hh |= set(c.search("OR", "SUBJECT", qs(t), "OR", "FROM", qs(t), "OR", "TO", qs(t), "CC", qs(t)))
-                if not a.no_text_search:
-                    try: tt |= set(c.search("TEXT", qs(t), retries=1))
-                    except Exception as e: sd["text_search_error"] = type(e).__name__; c.m = None
-            tt |= hh
-            if hh or tt:
-                sd["header_hits"] += len(hh); sd["text_hits"] += len(tt); sd["by_folder"][info["display"]] = {"header": len(hh), "text": len(tt)}
-                basis = folder_years(c, "sent") if info["imported_archive"] else ys
-                for y, u in basis.items():
-                    n = len(u & tt)
-                    if n: sd["by_year"][str(y)] = sd["by_year"].get(str(y), 0) + n
-                seed_hits.setdefault(sname, []).append((info["name"], pick(tt, 15)))
+            x = hit["seeds"].get(sname) or {"hh": 0, "tt": [], "by_year": {}, "err": ""}
+            if x["err"]: sd["text_search_error"] = x["err"]
+            if x["hh"] or x["tt"]:
+                sd["header_hits"] += x["hh"]; sd["text_hits"] += len(x["tt"]); sd["by_folder"][info["display"]] = {"header": x["hh"], "text": len(x["tt"])}
+                for y, n in x["by_year"].items(): sd["by_year"][y] = sd["by_year"].get(y, 0) + n
+                seed_hits.setdefault(sname, []).append((info["name"], pick(x["tt"], 15)))
     for sname, lst in seed_hits.items():                           # who are the people/domains behind each seed (header peek only)
         sd = S["seeds"][sname]; ca = collections.Counter(); cd = collections.Counter(); sj = []
         for fname, uids in lst:
@@ -431,6 +666,8 @@ def survey_collect(a):
         sd["contacts"] = [{"addr": k[0], "name": k[1], "n": v} for k, v in ca.most_common(12)]; sd["domains"] = cd.most_common(8); sd["subjects"] = sorted(set(sj))[:12]
     # aggregates
     selfs = [a_ for a_, _ in selfaddr.most_common(5)]; S["self_addresses"] = selfs
+    owner = max(W["self_name"], key=W["self_name"].get) if W["self_name"] else ""; S["owner_name"] = owner
+    S["possible_self_addresses"] = sorted(k for k, v in sent_corr.items() if owner and len(owner.split()) >= 2 and k not in selfaddr and re.sub(r"\s+", " ", (v["name"] or "").strip().lower()) == owner)
     yt = collections.Counter(); ytd = collections.Counter()
     for info in S["folders"]:
         for y, n in info.get("years_internal", {}).items(): yt[int(y)] += n
@@ -471,7 +708,11 @@ def survey_collect(a):
                 dups.append({"a": A["display"], "b": B["display"], "sample_msgid_overlap": round(ov, 2), "same_count": A["messages"] == B["messages"]})
     S["duplicate_folders"] = dups
     S["sample_sizes"] = {"per_year_per_folder": a.sample, "sent_per_year": a.sent_sample}
+    S["imap_stats"] = {"reconnects": c.reconnects, "no_responses": c.no_responses}
+    if c.reconnects or c.no_responses: S["quirks"].append(f"IMAP connection: {c.reconnects} reconnect(s), {c.no_responses} refused FETCH batch(es) during the survey (handled; counts above are still exact)")
     S["elapsed_s"] = round(time.time() - t0)
+    try: c.m and c.m.logout()
+    except Exception: pass
     return S
 
 def survey_plan(S):
@@ -497,17 +738,18 @@ def survey_plan(S):
     pd = [x["domain"] for x in S["candidate_domains"] if x["two_way"]][:25]
     sd_ = [d for d, v in S["noise_domains"] if v >= 3][:40]
     return {"version": 1, "generated": S["generated"], "folders": folders, "priority_domains": pd, "skip_domains": sd_,
-            "phases": ["A: deep-mine Sent folders (all years)", "B: seed dossiers (live SEARCH) once A is done", "C: remaining deep folders by priority, newest year-band first", "D: headers-only folders (contacts table completeness)"]}
+            "self_addresses": S.get("possible_self_addresses", []),
+            "phases": ["A: deep-mine Sent folders (all years)", "B: remaining deep folders by priority, newest year-band first", "C: headers-only folders (contacts table completeness)"]}
 
 def survey_report(S, P):
     L = []; w = L.append; tot = sum(f.get("messages") or 0 for f in S["folders"])
-    w(f"# Mailbox survey report\n\nGenerated {S['generated']} · host `{S['host']}` · {len(S['folders'])} selectable folders · **{tot:,} messages** · survey used only LIST / STATUS / EXAMINE / SEARCH counts and sampled header peeks (no bodies fetched). Sample: up to {S['sample_sizes']['per_year_per_folder']} headers per folder-year ({S['sample_sizes']['sent_per_year']} for Sent). Percentages and domain volumes are *estimates scaled from samples*; counts from SEARCH are exact.\n")
+    w(f"# Mailbox survey report\n\nGenerated {S['generated']} (UTC) · host `{S['host']}` · {len(S['folders'])} selectable folders · **{tot:,} messages** · survey used only LIST / STATUS / EXAMINE / SEARCH counts and sampled header peeks (no bodies fetched). Sample: up to {S['sample_sizes']['per_year_per_folder']} headers per folder-year ({S['sample_sizes']['sent_per_year']} for Sent). Percentages and domain volumes are *estimates scaled from samples*; counts from SEARCH are exact.\n")
     w("**Review required:** read sections 1-9, edit `mining-plan.json` if needed, then run `approve-survey`. Mining will not start before that.\n")
-    w("## 1. Folders\n\n| Folder | Msgs | Date range (INTERNALDATE) | Noise | Attach | Flags |\n|---|---:|---|---:|---:|---|")
+    w("## 1. Folders\n\n| Folder | Msgs | Unread | Date range (INTERNALDATE) | Noise | Attach | Flags |\n|---|---:|---:|---|---:|---:|---|")
     for i in S["folders"]:
         fl = [x for x in ("sent", "junk", "drafts", "nonmail") if i.get(x)] + (["IMPORTED-ARCHIVE"] if i.get("imported_archive") else [])
         rng = (f"{i.get('first_internal','')}-{i.get('last_internal','')}" + (f" (Date hdr {i.get('first_date_hdr')}-{i.get('last_date_hdr')})" if i.get("imported_archive") else "")) if i.get("years_internal") else ""
-        w(f"| {i['display']} | {i.get('messages') or 0:,} | {rng} | {int(i.get('noise_share',0)*100)}% | {int(i.get('att_share',0)*100)}% | {', '.join(fl)} |")
+        w(f"| {i['display']} | {i.get('messages') or 0:,} | {i.get('unseen') if i.get('unseen') is not None else ''} | {rng} | {int(i.get('noise_share',0)*100)}% | {int(i.get('att_share',0)*100)}% | {', '.join(fl)} |")
     w("\n## 2. Volume per year (exact SEARCH counts; folders summed)\n")
     w("| Year | INTERNALDATE count | Date-header est. |  | Year | INTERNALDATE count | Date-header est. |\n|---|---:|---:|---|---|---:|---:|")
     yrs = sorted(set(map(int, S["year_totals_internal"])) | set(map(int, S["year_totals_date_header"]))); half = (len(yrs) + 1) // 2
@@ -523,6 +765,7 @@ def survey_report(S, P):
         if not d["from"] and not d["to"]: continue
         w(f"- **{b[0]}** - from: " + ", ".join(f"{x} ({n})" for x, n in d["from"][:8]) + " · to/cc: " + ", ".join(f"{x} ({n})" for x, n in d["to"][:8]))
     w("\n## 4. Sent-folder correspondents (strongest two-way signal)\n\n| Person | Address | Est. msgs sent | Years | Wrote back? |\n|---|---|---:|---|---|")
+    if P.get("self_addresses"): w(f"\n**Possibly your own other addresses** (sent to under your own name): {', '.join(P['self_addresses'])}. They are listed in `mining-plan.json` → `self_addresses` and will be treated as you, not as contacts. Remove any that are not you, and add any other addresses of yours, before `approve-survey`.\n")
     for x in S["sent_correspondents"][:30]: w(f"| {x['name']} | {x['addr']} | {x['est_sent']} | {x['first']}-{x['last']} | {'yes (~'+str(x['replied_back_est'])+')' if x['two_way'] else 'not seen in samples'} |")
     w("\n## 5. Noise share\n")
     w("Overall bulk/list/noreply/ESP share by folder is in section 1. Top noise domains (est.): " + ", ".join(f"{d} ({n})" for d, n in S["noise_domains"][:12]))
@@ -538,6 +781,7 @@ def survey_report(S, P):
         if i.get("issues"): q.append("issues in samples (est. msgs): " + ", ".join(f"{k}={v}" for k, v in i["issues"].items()))
         if i.get("accounted") is not None and i["accounted"] != i["messages"]: q.append(f"{i['messages']-i['accounted']} msgs not covered by date windows")
         if q: w(f"- **{i['display']}**: " + "; ".join(q))
+    for q in S.get("quirks", []): w(f"- {q}")
     for d in S["duplicate_folders"]: w(f"- Possible duplicate/overlapping folders: **{d['a']}** and **{d['b']}** (sample Message-ID overlap {d['sample_msgid_overlap']}, same count: {d['same_count']}) - the crawl de-duplicates by Message-ID, but confirm with David.")
     w("\n## 8. Where the signal is\n\n**Candidate client/organisation domains** (two-way first): " + ", ".join(f"{x['domain']}{' ⇄' if x['two_way'] else ''} (in {x['est_in']}/out {x['est_sent_to']})" for x in S["candidate_domains"][:25]))
     if S["freemail_correspondents"]: w("\n**Free-mail correspondents David writes to** (individuals, often freelancers/vendors): " + ", ".join(f"{x['name'] or x['addr']} ({x['est_sent']})" for x in S["freemail_correspondents"][:10]))
@@ -550,24 +794,35 @@ def survey_report(S, P):
     est_all = sum(f["messages"] for f in P["folders"] if f["action"] != "skip"); est_deep = sum(f["est_non_noise"] for f in P["folders"] if f["action"] == "deep")
     rs = [i.get("reply_share", 0) * (i.get("messages") or 0) for i in S["folders"] if i.get("messages")]
     est_threads = round(est_deep * (1 - (sum(rs) / max(1, tot))))
-    w(f"\n## 9. Estimated volumes for the mining stages (messages, not time or cost)\n\n- Header crawl (stage 1): ~{est_all:,} messages in folders not skipped.\n- Body fetch after the noise filter (stage 3): ~{est_deep:,} messages in deep folders (sample-based; real number known after `filter`).\n- Threads to classify: roughly {est_threads:,} (non-reply share of kept messages; real number known after `thread`).")
+    w(f"\n## 9. Estimated volumes for the mining stages (messages, not time or cost)\n\n- Header crawl (stage 1): ~{est_all:,} messages in folders not skipped.\n- Body fetch after the noise filter (stage 3): ~{est_deep:,} messages in deep folders (sample-based; real number known after `filter`).\n- Threads to group: roughly {est_threads:,} (non-reply share of kept messages; real number known after `thread`).")
     w("\n## 10. Recommended mining plan (also in `mining-plan.json`)\n\n| Order | Folder | Action | Msgs | Dates by | Years | Why |\n|---:|---|---|---:|---|---|---|")
     for n, f in enumerate(P["folders"], 1): w(f"| {n} | {f['display']} | **{f['action']}** | {f['messages']:,} | {f['date_basis']} | {'-'.join(map(str, f['years'])) if f['years'] else ''} | {f['why']} |")
     w("\nPhases: " + " → ".join(P["phases"]))
     w("\n**Mine first (priority senders/domains):** " + (", ".join(P["priority_domains"][:20]) or "none identified") + "\n\n**Skip as noise:** " + (", ".join(P["skip_domains"][:25]) or "none identified") + "\n\nSkipped/headers-only folders still get a header crawl if you choose, so contacts stay complete; bodies are never fetched for them.")
     return "\n".join(L) + "\n"
 
+def write_text(path, text):
+    """atomic write: a reader (the bot) never sees a half-written report/CSV"""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as fh: fh.write(text)
+    os.replace(tmp, path)
+def write_csv(path, rows):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as fh: csv.writer(fh).writerows(rows)
+    os.replace(tmp, path)
 def cmd_survey(a):
-    S = survey_collect(a); P = survey_plan(S); os.makedirs(a.out, exist_ok=True)
-    json.dump(S, open(os.path.join(a.out, "survey.json"), "w"), indent=1, default=list)
-    json.dump(P, open(os.path.join(a.out, "mining-plan.json"), "w"), indent=1)
-    open(os.path.join(a.out, "survey-report.md"), "w").write(survey_report(S, P))
-    db = opendb(a.db); meta_set(db, "survey_done", S["generated"]); meta_set(db, "survey_approved", "")
+    db = opendb(a.db); stage(db, "survey", "running")
+    S = survey_collect(a, db); P = survey_plan(S); os.makedirs(a.out, exist_ok=True)
+    write_text(os.path.join(a.out, "survey.json"), json.dumps(S, indent=1, default=sorted))
+    write_text(os.path.join(a.out, "mining-plan.json"), json.dumps(P, indent=1))
+    write_text(os.path.join(a.out, "survey-report.md"), survey_report(S, P))
+    meta_set(db, "survey_done", S["generated"]); meta_set(db, "survey_approved", ""); stage(db, "survey", "done")
+    db.execute("delete from survey_cache"); db.commit()
     print(f"survey written to {a.out}/ (survey-report.md, survey.json, mining-plan.json). Review, then: approve-survey")
 def cmd_approve(a):
     db = opendb(a.db)
     if not meta_get(db, "survey_done"): raise SystemExit("run `survey` first")
-    meta_set(db, "survey_approved", time.strftime("%Y-%m-%d %H:%M")); print("survey approved; crawl may start")
+    meta_set(db, "survey_approved", utcnow()); print("survey approved; crawl may start")
 
 # ---------------------------------------------------------------- STAGE 1: crawl (headers + structure, all folders, resumable)
 def need_survey(db):
@@ -575,78 +830,131 @@ def need_survey(db):
         raise SystemExit("Stage 0 not done: run `survey`, review survey-report.md with the owner, then `approve-survey`. Mining refuses to start before that.")
 def load_plan(a):
     p = os.path.join(a.out, "mining-plan.json"); return json.load(open(p)) if os.path.exists(p) else None
+MSG_COLS = "msgid,irt,refs,from_addr,from_name,subject,ts,date_bad,size,has_att,att,parts,bulk,hints,is_sent"
 def store_message(db, folder, is_sent, uid, x):
+    """Upsert by (folder, uid) keeping the row id, so bodies/sigs/decisions stay attached when a message is seen again."""
     h = parse_headers(x["sections"].get(f"HEADER.FIELDS ({HDR_FIELDS})", b""), x.get("idate"))
     parts, atts = struct_info(x.get("struct"))
-    cur = db.execute("insert or replace into messages(folder,uid,msgid,irt,refs,from_addr,from_name,subject,ts,date_bad,size,has_att,att,parts,bulk,hints,is_sent) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (folder, uid, h["msgid"], h["irt"], " ".join(h["refs"]), h["from"][0], h["from"][1], h["subject"], h["ts"], h["date_bad"], int(x.get("size") or 0), 1 if atts else 0,
-         json.dumps(atts), json.dumps(parts), h["bulk"], ",".join(h["hints"]), is_sent))
-    mid = cur.lastrowid
+    vals = (h["msgid"], h["irt"], " ".join(h["refs"]), h["from"][0], h["from"][1], h["subject"], h["ts"], h["date_bad"], int(x.get("size") or 0), 1 if atts else 0,
+            json.dumps(atts), json.dumps(parts), h["bulk"], ",".join(h["hints"]), is_sent)
+    row = db.execute("select id from messages where folder=? and uid=?", (folder, uid)).fetchone()
+    if row:
+        mid = row[0]; db.execute("update messages set " + ",".join(c + "=?" for c in MSG_COLS.split(",")) + " where id=?", vals + (mid,))
+    else:
+        mid = db.execute(f"insert into messages(folder,uid,{MSG_COLS}) values(?,?,{','.join('?' * 15)})", (folder, uid) + vals).lastrowid
     db.execute("delete from addrs where mid=?", (mid,))
     rows = [(mid, "from", *h["from"])] + [(mid, "to", *t) for t in h["to"]] + [(mid, "cc", *t) for t in h["cc"]]
     db.executemany("insert into addrs values(?,?,?,?)", [r for r in rows if r[2]])
+    return mid
+def forget_folder(db, nm):
+    ids = "select id from messages where folder=?"
+    for t, col in (("addrs", "mid"), ("bodies", "mid"), ("sigs", "mid")): db.execute(f"delete from {t} where {col} in ({ids})", (nm,))
+    db.execute("delete from messages where folder=?", (nm,)); db.execute("delete from crawl_skips where folder=?", (nm,))
+def imap_date(v):
+    """'2019' | 2019 | '2019-06-01' -> IMAP date '1-Jan-2019' / '1-Jun-2019'"""
+    v = str(v).strip(); m = re.match(r"^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?$", v)
+    if not m: raise SystemExit(f"bad date {v!r}: use YYYY or YYYY-MM-DD")
+    y, mo, d = int(m.group(1)), int(m.group(2) or 1), int(m.group(3) or 1)
+    return f"{d}-{'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split()[mo - 1]}-{y}"
+def dstr(y): return imap_date(y)
+def crawl_criteria(a, p):
+    pre = "SENT" if p and p.get("date_basis") == "SENTSINCE" else ""; crit = []
+    since = getattr(a, "since", None) or (p or {}).get("crawl_since"); before = getattr(a, "before", None) or (p or {}).get("crawl_before")
+    if since: crit += [pre + "SINCE", imap_date(since)]
+    if before: crit += [pre + "BEFORE", imap_date(before)]
+    return crit or ["ALL"]
+MAX_SKIP_TRIES = 3
 def crawl_folder(c, db, f, a, p):
-    nm = f["name"]; c.select(nm); uv = c.uidvalidity(); sent = 1 if is_sent_folder(f) else 0
-    row = db.execute("select * from folders where name=?", (nm,)).fetchone(); last = 0
-    if row and row["uidvalidity"] == uv: last = row["last_uid"]
-    elif row:
-        log(f"{f['display']}: UIDVALIDITY changed, re-crawling folder")
-        db.execute("delete from addrs where mid in (select id from messages where folder=?)", (nm,)); db.execute("delete from messages where folder=?", (nm,))
-    crit = ["ALL"]
-    if p and (p.get("crawl_since") or p.get("crawl_before")):
-        pre = "SENT" if p.get("date_basis") == "SENTSINCE" else ""; crit = []
-        if p.get("crawl_since"): crit += [pre + "SINCE", dstr(p["crawl_since"])]
-        if p.get("crawl_before"): crit += [pre + "BEFORE", dstr(p["crawl_before"])]
-    uids = [u for u in c.search(*crit) if u > last]
-    db.execute("insert or replace into folders(name,display,flags,uidvalidity,last_uid,total,done,is_sent,updated) values(?,?,?,?,?,?,?,?,?)", (nm, f["display"], f["flags"], uv, last, len(uids) + (row["done"] if row and row["uidvalidity"] == uv else 0), row["done"] if row and row["uidvalidity"] == uv else 0, sent, time.time()))
-    db.commit(); log(f"{f['display']}: {len(uids)} new messages to crawl (resume after UID {last})")
-    if a.dry_run: return len(uids)
-    done = row["done"] if row and row["uidvalidity"] == uv else 0; grand = done + len(uids)
-    for i in range(0, len(uids), a.batch):
-        b = uids[i:i + a.batch]; r = c.fetch(b, f"(UID RFC822.SIZE INTERNALDATE FLAGS {HDR_ITEMS} BODYSTRUCTURE)")
+    nm = f["name"]; c.select(nm); uv = c.uidvalidity(); sent = 1 if is_sent_folder(f) else 0; junk = 1 if is_junk_folder(f) else 0
+    row = db.execute("select * from folders where name=?", (nm,)).fetchone()
+    if row and uv and row["uidvalidity"] and row["uidvalidity"] != uv:
+        log(f"{f['display']}: UIDVALIDITY changed ({row['uidvalidity']} -> {uv}); the server renumbered this folder, re-crawling it")
+        forget_folder(db, nm); db.commit()
+    crit = crawl_criteria(a, p)
+    match = c.search(*crit)
+    have = {r[0] for r in db.execute("select uid from messages where folder=?", (nm,))}
+    gave_up = {r[0] for r in db.execute("select uid from crawl_skips where folder=? and tries>=?", (nm, MAX_SKIP_TRIES))}
+    todo = sorted(set(match) - have - gave_up)
+    if getattr(a, "limit", None) and len(todo) > a.limit: todo = todo[-a.limit:]     # newest UIDs first when bounded; the rest are picked up by the next run
+    n_have = len(set(match) & have)
+    db.execute("insert or replace into folders(name,display,flags,uidvalidity,last_uid,total,done,is_sent,updated,is_junk,crit) values(?,?,?,?,?,?,?,?,?,?,?)",
+               (nm, f["display"], f["flags"], uv or (row["uidvalidity"] if row else 0), max(have) if have else 0, len(match), n_have, sent, time.time(), junk, " ".join(crit)))
+    db.commit(); log(f"{f['display']}: {len(match)} match {' '.join(crit)}; {n_have} already stored; {len(todo)} to crawl now" + (f"; {len(gave_up)} unfetchable after {MAX_SKIP_TRIES} tries" if gave_up else ""))
+    if a.dry_run: return len(todo)
+    done = n_have; items = f"(UID RFC822.SIZE INTERNALDATE FLAGS {HDR_ITEMS} BODYSTRUCTURE)"
+    for i in range(0, len(todo), a.batch):
+        b = todo[i:i + a.batch]; r = c.fetch(b, items)
         for u in b:
             if u in r: store_message(db, nm, sent, u, r[u])
-        done += len(b); db.execute("update folders set last_uid=?, done=?, updated=? where name=?", (max(b), done, time.time(), nm)); db.commit()
-        if (i // a.batch) % 10 == 0: log(f"  {f['display']}: {done}/{grand}")
+            else: db.execute("insert into crawl_skips values(?,?,?,1,?,?) on conflict(folder,uid) do update set tries=tries+1, ts=excluded.ts", (nm, u, uv, "no FETCH data returned", time.time()))
+        got = [u for u in b if u in r]
+        if got: db.execute("delete from crawl_skips where folder=? and uid in (%s)" % ",".join(map(str, got)), (nm,))
+        done += len(got)
+        db.execute("update folders set last_uid=max(last_uid, ?), done=?, updated=? where name=?", (max(got) if got else 0, done, time.time(), nm)); db.commit()
+        if (i // a.batch) % 10 == 0: log(f"  {f['display']}: {done}/{len(match)}")
         time.sleep(a.delay)
-    return len(uids)
+    return len(todo)
 def cmd_crawl(a):
     db = opendb(a.db); need_survey(db); c = Conn(a); plan = load_plan(a); pf = {f["name"]: f for f in plan["folders"]} if plan else {}
+    stage(db, "crawl", "running")
     fl = [f for f in list_folders(c) if not is_nonmail_folder(f)]
     fl.sort(key=lambda f: (pf.get(f["name"], {}).get("priority", 5 if not is_junk_folder(f) else 9)))
-    total = 0
+    total = 0; failed = []
     for f in fl:
         p = pf.get(f["name"])
         if p and p["action"] == "skip" and not a.include_skipped: log(f"skip {f['display']} (plan)"); continue
         if not p and (is_junk_folder(f) or is_drafts_folder(f)) and not a.include_skipped: continue
         meta_set(db, "action:" + f["name"], p["action"] if p else "deep")
-        total += crawl_folder(c, db, f, a, p)
-    print(f"crawl complete: {db.execute('select count(*) from messages').fetchone()[0]} messages in db ({total} new this run)" + (" [dry-run]" if a.dry_run else ""))
+        for attempt in (1, 2):
+            try: total += crawl_folder(c, db, f, a, p); break
+            except UidValidityChanged:
+                log(f"{f['display']}: UIDVALIDITY changed during the crawl; restarting this folder"); c.uv.pop(f["name"], None); db.execute("update folders set uidvalidity=-1 where name=?", (f["name"],)); db.commit()
+            except (ValueError, imaplib.IMAP4.error) as e:
+                log(f"{f['display']}: cannot crawl ({str(e)[:100]}); continuing with other folders"); failed.append(f["display"]); break
+    n = db.execute('select count(*) from messages').fetchone()[0]
+    stage(db, "crawl", "done", f"{n} messages" + (f"; failed folders: {', '.join(failed)}" if failed else ""))
+    print(f"crawl complete: {n} messages in db ({total} new this run)" + (f"; could not open: {', '.join(failed)}" if failed else "") + (" [dry-run]" if a.dry_run else ""))
 
 # ---------------------------------------------------------------- STAGE 2: pre-filter + per-sender decision table
 def self_set(db, a):
     s = {x.strip().lower() for x in os.environ.get("DCR_SELF", "").split(",") if x.strip()} | ({a.user.lower()} if getattr(a, "user", None) else set())
+    s |= {x.strip().lower() for x in (load_plan(a) or {}).get("self_addresses", []) if isinstance(x, str) and "@" in x}   # owner-confirmed list from the survey plan
     db.execute("update messages set is_sent=1 where folder in (select name from folders where is_sent=1)")
     for r in db.execute("select from_addr, count(*) n from messages where is_sent=1 group by from_addr having n>=2"): s.add(r[0])
     db.execute("update messages set is_sent=1 where from_addr in (%s)" % ",".join("?" * len(s)), tuple(s)) if s else None
     return s
+DSN_FROM = re.compile(r"^(mailer-daemon|postmaster|mail-daemon|microsoftexchange[0-9a-f]{32})@", re.I)      # Exchange/Office 365 sends from MicrosoftExchange<32 hex>@domain
+DSN_SUBJ = re.compile(r"undeliver|delivery status|failure notice|returned mail|delivery failed|delivery has failed|undelivered|could not be delivered|not delivered|returned to sender|delayed mail|delivery (?:delayed|incomplete)", re.I)
+def is_dsn(addr, subj): return bool(DSN_FROM.match(addr or "") and DSN_SUBJ.search(subj or ""))
+DSN_REASON = "delivery failure notice"   # filter marks bounce messages this way; fetch still stores their body so `bounces` can read the failed address
 def cmd_filter(a):
-    db = opendb(a.db); selfs = self_set(db, a); meta_set(db, "self", json.dumps(sorted(selfs)))
+    db = opendb(a.db); stage(db, "filter", "running"); selfs = self_set(db, a); meta_set(db, "self", json.dumps(sorted(selfs)))
+    junk_folders = {r["name"] for r in db.execute("select name, flags, display from folders") if is_junk_folder({"flags": r["flags"] or "", "display": r["display"] or r["name"]})}
     plan = load_plan(a) or {}; pri = set(plan.get("priority_domains", [])); skipd = set(plan.get("skip_domains", []))
     ov = {}
     ovf = os.path.join(a.out, "sender-overrides.csv")
     if os.path.exists(ovf):
-        for r in csv.reader(open(ovf)):
-            if len(r) >= 2 and r[1] in ("keep", "noise"): ov[r[0].strip().lower()] = r[1]
+        with open(ovf, encoding="utf-8-sig") as fh:
+            for r in csv.reader(fh):
+                if len(r) >= 2 and r[1].strip().lower() in ("keep", "noise"): ov[r[0].strip().lower()] = r[1].strip().lower()
     # duplicates across folders (same Message-ID)
     db.execute("update messages set decision=null, dreason=null")
+    for t, col in (("addrs", "addr"), ("messages", "from_addr"), ("sigs", "addr")):          # rows stored before Hide-My-Email decoding existed
+        for (ad,) in db.execute(f"select distinct {col} from {t} where {col} like '%\\_at\\_%' escape '\\' and ({col} like '%@icloud.com' or {col} like '%@privaterelay.appleid.com')").fetchall():
+            if real_addr(ad) != ad: db.execute(f"update {t} set {col}=? where {col}=?", (real_addr(ad), ad))
+    lc = [r[0] for r in db.execute("select id, subject from messages where is_sent=1").fetchall() if LISTCMD_SUBJ.match(r[1] or "")]
+    lc += [r[0] for r in db.execute("select m.id, group_concat(a.addr, ' ') from messages m join addrs a on a.mid=m.id and a.role in ('to','cc') where m.is_sent=1 group by m.id").fetchall()
+           if r[1] and all(is_listcmd(x) for x in r[1].split())]
+    db.executemany("update messages set decision='noise', dreason='unsubscribe request sent by owner' where id=?", [(i,) for i in set(lc)])
     db.execute("update messages set decision='dup', dreason='duplicate message-id' where id in (select m.id from messages m join messages k on k.msgid=m.msgid and k.msgid!='' and k.id<m.id)")
     sent_refs = set(); written = collections.Counter(); sent_dom = collections.Counter()
-    for r in db.execute("select irt, refs, id from messages where is_sent=1"):
+    for r in db.execute("select irt, refs, id from messages where is_sent=1 and decision is null"):
         if r[0]: sent_refs.add(r[0])
         sent_refs.update((r[1] or "").split())
-    for r in db.execute("select a.addr from addrs a join messages m on m.id=a.mid where m.is_sent=1 and a.role in ('to','cc')"):
-        written[r[0]] += 1; sent_dom[dom_of(r[0])] += 1
+    for r in db.execute("select a.addr from addrs a join messages m on m.id=a.mid where m.is_sent=1 and m.decision is null and a.role in ('to','cc')"):
+        if is_listcmd(r[0]): continue
+        written[r[0]] += 1
+        if not is_automated(r[0]): sent_dom[dom_of(r[0])] += 1
     st = {}
     for r in db.execute("select id,from_addr,from_name,msgid,ts,bulk,subject,has_att,att from messages where is_sent=0 and from_addr!='' and (decision is null)"):
         s = st.setdefault(r["from_addr"], {"name": r["from_name"], "n": 0, "rep": 0, "bulk": 0, "first": r["ts"], "last": r["ts"], "proj": 0})
@@ -660,6 +968,7 @@ def cmd_filter(a):
         elif wt: k, why = "keep", "two-way: David wrote to this address"
         elif d in pri: k, why = "keep", "priority domain from survey"
         elif NOISE_LOCAL.match(loc) and s["bulk"] >= 1: k, why = "noise", "noreply/automated address + bulk headers"
+        elif is_automated(ad): k, why = "noise", "automated or bulk-mail sending address"
         elif d in ESP or d in skipd and s["rep"] == 0: k, why = "noise", "ESP / survey noise domain"
         elif s["bulk"] / s["n"] >= 0.5: k, why = "noise", "bulk/list headers"
         elif s["n"] >= 6 and s["rep"] == 0 and s["proj"] / s["n"] < 0.2 and d not in FREE: k, why = "noise", "one-way blast (>=6 msgs, never replied, no project signals)"
@@ -668,12 +977,13 @@ def cmd_filter(a):
         dec[ad] = (k, why)
         db.execute("insert or replace into senders values(?,?,?,?,?,?,?,?,?,?,?)", (ad, s["name"], d, s["n"], s["rep"], s["bulk"], wt, s["first"], s["last"], k, why))
     n_up = 0
-    for r in db.execute("select id,from_addr,subject,folder,has_att,att,bulk from messages where is_sent=0 and decision is null").fetchall():
+    for r in db.execute("select id,from_addr,subject,folder,has_att,att,bulk,msgid from messages where is_sent=0 and decision is null").fetchall():
         k, why = dec.get(r["from_addr"], ("keep", "no sender"))
-        if re.match(r"(mailer-daemon|postmaster)", r["from_addr"]) and re.search(r"undeliver|delivery status|failure notice|returned mail|delivery failed|undelivered|could not be delivered", r["subject"] or "", re.I):
-            db.execute("update messages set decision='bounce', dreason='delivery failure notice (read for dead addresses)' where id=?", (r["id"],)); continue
-        junk = re.search(r"(junk|spam|trash|deleted|bulk)", r["folder"], re.I) and not written.get(r["from_addr"])
+        if is_dsn(r["from_addr"], r["subject"]):
+            db.execute("update messages set decision='noise', dreason=? where id=?", (DSN_REASON, r["id"])); continue
+        junk = r["folder"] in junk_folders and not written.get(r["from_addr"])
         if junk: k, why = "noise", "junk/trash folder"
+        elif k == "keep" and r["bulk"] and r["msgid"] not in sent_refs and r["from_addr"] not in ov and dom_of(r["from_addr"]) not in ov: k, why = "noise", "mailing-list/bulk message David did not reply to"
         elif k == "keep" and SUBJ_NOISE.search(r["subject"] or "") and not written.get(r["from_addr"]) and not SUBJ_PROJECT.search(r["subject"] or ""): k, why = "noise", "promotional/receipt subject"
         elif k == "noise" and not r["bulk"] and SUBJ_PROJECT.search(r["subject"] or "") and r["has_att"] and not NOISE_LOCAL.match(r["from_addr"].split("@")[0]) and r["from_addr"] not in ov and dom_of(r["from_addr"]) not in ESP:
             k, why = "keep", "project-like subject + attachment from human (rescued from sender-level noise)"; n_up += 1
@@ -683,7 +993,7 @@ def cmd_filter(a):
     cnt = db.execute("select decision, count(*) from messages group by decision").fetchall()
     print("filter decisions:", {r[0]: r[1] for r in cnt}, f"| rescued {n_up} project-like messages from noise senders")
     top = db.execute("select addr,n,reason from senders where decision='noise' order by n desc limit 15").fetchall()
-    print("top noise senders:", "; ".join(f"{r[0]}({r[1]})" for r in top))
+    print("top noise senders:", "; ".join(f"{r[0]}({r[1]})" for r in top)); stage(db, "filter", "done")
 
 # ---------------------------------------------------------------- STAGE 3: selective body fetch + quote/signature split + signature parsing
 class _Strip(HTMLParser):
@@ -701,16 +1011,15 @@ def html_to_text(h):
     try: p.feed(h)
     except Exception: return re.sub(r"<[^>]+>", " ", h)
     return re.sub(r"\n\s*\n\s*\n+", "\n\n", re.sub(r"[ \t\xa0]+", " ", "".join(p.o))).strip()
-def decode_part(raw, enc, charset, ctype):
+def decode_part(raw, enc, charset, ctype, truncated=False):
     try:
         if enc == "base64": raw = base64.b64decode(raw + b"=" * (-len(raw.strip()) % 4))
         elif enc == "quoted-printable": raw = quopri.decodestring(raw)
     except Exception: pass
-    for cs in (charset, "utf-8", "windows-1252"):
-        if not cs: continue
-        try: t = raw.decode(cs); break
-        except Exception: continue
-    else: t = raw.decode("latin-1", "replace")
+    t = decode_bytes(raw, charset, truncated=truncated)
+    if ctype == "text/html" and not charset:
+        mm = re.search(rb"<meta[^>]+charset=[\"']?([\w.:-]+)", raw[:4000], re.I)
+        if mm: t = decode_bytes(raw, mm.group(1).decode("ascii", "ignore"))
     t = t.replace("\r\n", "\n").replace("\r", "\n")
     return html_to_text(t) if ctype == "text/html" else t
 QSTART = re.compile(r"^(on .{5,250}wrote:|-{2,}\s*(original message|forwarded message)\s*-{2,}|_{8,}|begin forwarded message:?)$", re.I)
@@ -726,7 +1035,7 @@ def split_quote(t):
 CLOSER = re.compile(r"^(thanks|thank you|many thanks|best|best regards|regards|kind regards|warm regards|warmly|cheers|sincerely|talk soon|all the best|take care|respectfully|-?\s?d(avid)?|dave)[,!.\s]*$", re.I)
 PHONE = re.compile(r"(?:\+?1[\s.\-]?)?\(?\b\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b")
 SITE = re.compile(r"((?:https?://)?(?:www\.)[\w.\-/]+|https?://[\w.\-/]+|\b[\w\-]+\.(?:com|net|org|tv|co|io|studio|agency)\b/?)", re.I)
-TITLE = re.compile(r"\b(vp|vice president|svp|evp|president|ceo|coo|founder|co-?founder|owner|partner|principal|director|head of [\w ]+|executive producer|producer|line producer|production manager|manager|coordinator|supervisor|art director|creative director|production designer|set designer|set decorator|designer|buyer|art buyer|producer|editor|photographer|stylist|agent|rep|assistant|associate|lead|chief [\w ]+)\b", re.I)
+TITLE = re.compile(r"\b(vp|vice president|svp|evp|president|ceo|coo|founder|co-?founder|owner|partner|principal|director|head of [\w ]+|executive producer|producer|line producer|production manager|manager|coordinator|supervisor|art director|creative director|production designer|set designer|set decorator|designer|buyer|art buyer|producer|editor|photographer|stylist|agent|rep|assistant|associate|lead|chief [\w ]+|artist|carpenter|fabricator|builder|painter|estimator|planner|account (?:manager|executive)|professor|lecturer|dean|attorney|counsel|analyst|engineer|architect|consultant|recruiter|broker|headhunter)\b", re.I)
 def split_sig(t):
     L = t.rstrip().split("\n")
     for i in range(len(L) - 1, max(-1, len(L) - 16), -1):
@@ -735,9 +1044,9 @@ def split_sig(t):
     paras = re.split(r"\n\s*\n", t.rstrip())
     if len(paras) >= 2 and len(paras[-1].split("\n")) <= 8 and (PHONE.search(paras[-1]) or SITE.search(paras[-1])): return "\n\n".join(paras[:-1]).strip(), paras[-1].strip()
     return t.strip(), ""
-def parse_sig(sig, name):
+def parse_sig(sig, addr=""):
     if not sig: return None
-    lines = [l.strip(" \t|·•") for l in sig.split("\n") if l.strip()][:10]; r = {"title": "", "company": "", "phone": "", "site": ""}
+    lines = [l.strip(" \t|·•") for l in sig.split("\n") if l.strip()][:10]; r = {"name": sig_name(sig, addr) if addr else "", "title": "", "company": "", "phone": "", "site": ""}
     for i, l in enumerate(lines):
         if not r["phone"] and PHONE.search(l): r["phone"] = PHONE.search(l).group()
         if not r["site"] and SITE.search(l) and "@" not in l.replace(SITE.search(l).group(), ""): r["site"] = SITE.search(l).group().rstrip("/")
@@ -754,8 +1063,13 @@ def fetch_bodies(db, c, rows, cap=60000, batch=50):
     by = collections.defaultdict(list)
     for r in rows: by[r["folder"]].append(r)
     for folder, lst in by.items():
-        c.select(folder)
+        try: c.select(folder)
+        except (ValueError, imaplib.IMAP4.error) as e: log(f"fetch: cannot open {folder} ({str(e)[:80]}); skipped this run"); continue
+        r0 = db.execute("select uidvalidity from folders where name=?", (folder,)).fetchone()
+        if r0 and r0[0] and c.uv.get(folder) and r0[0] != c.uv[folder]:
+            log(f"fetch: {folder} UIDVALIDITY changed since the crawl ({r0[0]} -> {c.uv[folder]}); UIDs no longer match. Re-run `crawl` first; skipped."); continue
         for i in range(0, len(lst), batch):
+            if i and (i // batch) % 20 == 0: log(f"  fetch: {folder} {i}/{len(lst)}")
             chunk = lst[i:i + batch]; groups = collections.defaultdict(list); meta = {}
             for r in chunk:
                 parts = json.loads(r["parts"] or "[]"); pick_ = next((p for p in parts if p["type"] == "text/plain"), None) or next((p for p in parts if p["type"] == "text/html"), None)
@@ -764,31 +1078,46 @@ def fetch_bodies(db, c, rows, cap=60000, batch=50):
             for path, uids in groups.items():
                 got = c.fetch(uids, f"(UID BODY.PEEK[{path}]<0.{cap}>)")
                 for u in uids:
-                    r, p_ = meta[u]; raw = got.get(u, {}).get("sections", {}).get(path.upper(), b"")
-                    t = decode_part(raw, p_["enc"], p_["charset"], p_["type"]); new, quoted = split_quote(t); body, sig = split_sig(new)
+                    if u not in got: continue          # server returned nothing: leave it for the next run instead of storing an empty body
+                    r, p_ = meta[u]; raw = got[u].get("sections", {}).get(path.upper(), b"") or b""
+                    t = decode_part(raw, p_["enc"], p_["charset"], p_["type"], truncated=len(raw) >= cap); new, quoted = split_quote(t); body, sig = split_sig(new)
                     db.execute("insert or replace into bodies values(?,?,?,?,?)", (r["id"], body[:20000], quoted[:3000], sig[:1500], 1 if len(raw) >= cap else 0))
-                    ps = parse_sig(sig, "")
-                    if ps and r["from_addr"] and r["decision"] != "bounce": db.execute("insert into sigs values(?,?,?,?,?,?,?,?)", (r["id"], r["from_addr"], "", ps["title"], ps["company"], ps["phone"], ps["site"], r["ts"]))
+                    ps = parse_sig(sig, r["from_addr"]) if not r["is_sent"] and r["decision"] == "keep" else None
+                    if ps and r["from_addr"]: db.execute("insert into sigs values(?,?,?,?,?,?,?,?)", (r["id"], r["from_addr"], ps["name"], ps["title"], ps["company"], ps["phone"], ps["site"], r["ts"]))
             db.commit()
         log(f"fetch: {folder} done")
+def body_candidates(db):
+    """messages whose body we may fetch: survived the filter AND live in a folder the plan marks deep"""
+    rows = db.execute("select id,folder,uid,parts,from_addr,ts,decision,is_sent from messages where (decision='keep' or dreason=?) and id not in (select mid from bodies) order by folder, uid", (DSN_REASON,)).fetchall()
+    act = {}
+    def deep(f):
+        if f not in act: act[f] = meta_get(db, "action:" + f, "deep") == "deep"
+        return act[f]
+    return [r for r in rows if deep(r["folder"])]
 def cmd_fetch(a):
-    db = opendb(a.db); need_survey(db); c = Conn(a)
-    rows = db.execute("select id,folder,uid,parts,from_addr,ts,decision from messages where decision in ('keep','bounce','seed') and id not in (select mid from bodies) order by folder, uid").fetchall()
-    rows = [r for r in rows if r["decision"] == "seed" or meta_get(db, "action:" + r["folder"], "deep") == "deep" or r["decision"] == "bounce"]
+    db = opendb(a.db); need_survey(db); stage(db, "fetch", "running")
+    if a.ids:        # on demand: the text of specific messages the filter dropped or a headers-only folder skipped (BODY.PEEK, same read-only path)
+        want = [int(x) for x in re.split(r"[,\s]+", a.ids.strip()) if x]
+        rows = db.execute(f"select id,folder,uid,parts,from_addr,ts,decision,is_sent from messages where id in ({','.join('?' * len(want))}) and coalesce(decision,'')!='dup' and id not in (select mid from bodies) order by folder, uid", want).fetchall()
+    else: rows = body_candidates(db)
     log(f"fetch: {len(rows)} messages need bodies")
     if a.dry_run: print(f"[dry-run] would fetch {len(rows)} bodies (text parts only, capped at {a.max_body} bytes each)"); return
-    fetch_bodies(db, c, rows, a.max_body, a.body_batch)
-    print("fetch complete:", db.execute("select count(*) from bodies").fetchone()[0], "bodies stored")
+    if rows:
+        try: fetch_bodies(db, Conn(a), rows, a.max_body, a.body_batch)
+        except UidValidityChanged as e: raise SystemExit(f"fetch: folder {e} was renumbered by the server (UIDVALIDITY changed). Run `crawl` again, then `fetch`.")
+    n = db.execute("select count(*) from bodies").fetchone()[0]; left = len(body_candidates(db))
+    stage(db, "fetch", "done", f"{n} bodies" + (f"; {left} still missing (server returned nothing; re-run to retry)" if left else ""))
+    print("fetch complete:", n, "bodies stored" + (f"; {left} could not be fetched this run (re-run to retry)" if left else ""))
 
 # ---------------------------------------------------------------- STAGE 4: thread reconstruction
 GENERIC_SUBJ = {"", "hi", "hello", "hey", "(no subject)", "no subject", "fwd", "photos", "pics", "question", "update", "thanks", "thank you", "info", "following up", "quick question"}
 def cmd_thread(a):
-    db = opendb(a.db); selfs = set(json.loads(meta_get(db, "self", "[]"))); par = {}
+    db = opendb(a.db); stage(db, "thread", "running"); selfs = set(json.loads(meta_get(db, "self", "[]"))); par = {}
     def find(x):
         while par.setdefault(x, x) != x: par[x] = par[par[x]]; x = par[x]
         return x
     def union(x, y): par[find(x)] = find(y)
-    rows = db.execute("select id,msgid,irt,refs,subject,ts,from_addr from messages where decision in ('keep','seed')").fetchall()
+    rows = db.execute("select id,msgid,irt,refs,subject,ts,from_addr from messages where decision='keep'").fetchall()
     byid = {}
     for r in rows:
         find(r["id"])
@@ -797,7 +1126,7 @@ def cmd_thread(a):
         for ref in ([r["irt"]] if r["irt"] else []) + (r["refs"] or "").split():
             if ref in byid: union(r["id"], byid[ref])
     parts = collections.defaultdict(set)
-    for r in db.execute("select mid, addr from addrs where mid in (select id from messages where decision in ('keep','seed'))"):
+    for r in db.execute("select mid, addr from addrs where mid in (select id from messages where decision='keep')"):
         if r["addr"] not in selfs: parts[r["mid"]].add(r["addr"])
     groups = collections.defaultdict(list)
     for r in rows:
@@ -809,524 +1138,600 @@ def cmd_thread(a):
             if q["ts"] - p["ts"] <= 180 * 86400 and (parts[p["id"]] & parts[q["id"]]): union(p["id"], q["id"])
     comp = collections.defaultdict(list)
     for r in rows: comp[find(r["id"])].append(r)
-    db.execute("delete from threads")
+    db.execute("delete from threads"); db.execute("update messages set thread=null where thread is not null")
     for root, g in comp.items():
         tid = min(r["id"] for r in g); g.sort(key=lambda r: r["ts"]); ppl = sorted(set().union(*[parts[r["id"]] for r in g]))
         subj = re.sub(r"^\s*((re|fw|fwd|aw)\s*:\s*)+", "", g[0]["subject"] or "", flags=re.I).strip() or norm_subject(g[0]["subject"])
         db.execute("insert into threads values(?,?,?,?,?,?)", (tid, subj, g[0]["ts"], g[-1]["ts"], len(g), json.dumps(ppl)))
         db.executemany("update messages set thread=? where id=?", [(tid, r["id"]) for r in g])
     db.commit(); n = db.execute("select count(*), max(n) from threads").fetchone()
-    print(f"threads: {n[0]} (largest has {n[1]} messages) from {len(rows)} kept messages")
+    stage(db, "thread", "done", f"{n[0]} threads"); print(f"threads: {n[0]} (largest has {n[1]} messages) from {len(rows)} kept messages")
 
-# ---------------------------------------------------------------- STAGE 5: entity linking (people <-> orgs, aliases, job changes over time)
-SEGMENTS = [  # (segment, name/domain regex, job-title regex)
-    ("Network/streamer publicity", r"paramount|netflix|hbo|\bnbc|\babc\b|cbs|\bfox\b|warner (bros|media)|disney|hulu|peacock|universal (pictures|studios)|sony pictures|lionsgate|mgm|network|streaming", r"publicity|key.?art|creative advertising|photo (manager|publicity)"),
-    ("Ad agency", r"agency|advertising|worldwide|bbdo|ogilvy|wieden|saatchi|mccann|droga|leo burnett|y&r|tbwa", r"art producer|agency producer|art buyer"),
-    ("Record label/management", r"records|music|\blabel\b|umg|interscope|republic|capitol|atlantic", r"a&r|artist manager|video commissioner|label"),
-    ("Photographer/rep", r"photograph|represent|\breps?\b", r"photographer|agent"),
-    ("Magazine", r"magazine|vogue|esquire|instyle|vanity fair|\belle\b|conde nast|time inc", r"photo (editor|director)|visuals director|picture editor"),
-    ("Production company", r"productions?\b|pictures\b|films?\b|entertainment|fieldhouse", r"executive producer|line producer|production manager|head of production"),
-    ("Partner/subcontractor", r"fabricat|scenic|scenery|metalworks|millwork|woodworks|construction|exhibit|set ?shop|prop (house|closet|shop)|propcloset|paint|lumber|printing|sign shop", r"prop (house|master)|fabricator|shop (owner|manager)"),
-    ("DTC brand", r"\bgear\b|travel|luggage|apparel|beauty|cosmetics|footwear|\bshop(ify)?\b", r"e-?commerce|growth marketing|brand (director|manager)"),
-    ("Brand in-house studio", r"pepsi|nike|apple|target|samsung|coca|beverages|foods|\bbrands?\b", r"creative production|studio producer|brand experiences|marketing (director|manager)|brand creative|content studio")]
-AREA = {"LA": ("310", "323", "818", "213", "424", "747", "626", "661", "805"), "NY": ("212", "646", "917", "718", "347", "929"), "Nashville": ("615", "629")}
-def segment_of(name, domain, titles):
-    best, bs = "", 0
-    for seg, nrx, trx in SEGMENTS:
-        sc = len(re.findall(nrx, f"{name} {domain}".lower())) * 2 + len(re.findall(trx, " ".join(titles).lower()))
-        if sc > bs: best, bs = seg, sc
-    return best
-def market_of(phones):
-    c = collections.Counter()
-    for p in phones:
-        d = re.sub(r"\D", "", p); d = d[1:] if len(d) == 11 and d[0] == "1" else d
-        for k, v in AREA.items():
-            if d[:3] in v: c[k] += 1
-    return c.most_common(1)[0][0] if c else ""
-def norm_co(s): return re.sub(r"\b(inc|llc|ltd|corp|co|the|company|incorporated)\b|[^a-z0-9]", "", s.lower())
+# ---------------------------------------------------------------- STAGE 5: contacts (one row per unique email address) + which threads they are in
+SIG_NAME = re.compile(r"^[A-Z][A-Za-z'’\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z'’\-]+){1,2}$")
+COMPANYISH = re.compile(r"\b(inc|llc|ltd|corp|co|company|studios?|productions?|pictures|films|group|agency|design|media|entertainment|records|events|creative|partners|associates|\w*works|scenic|shop|props|rentals|supply|lighting|construction|fabrication|photography|gallery|labs?)\b\.?$", re.I)
+WORK_ATT = re.compile(r"\.(pdf|xlsx?|docx?|psd|ai|eps|dwg|dxf|skp|3dm|rvt|indd|key|pptx?)$", re.I)
+def clean_name(n, addr=""):
+    n = re.sub(r"\s+", " ", (n or "").strip().strip("\"'")).strip()
+    if not n or "@" in n or n.lower() == addr.lower() or not re.search(r"[A-Za-z]", n): return ""
+    m = re.match(r"^([^,]+),\s*([^,]+)$", n)                       # "Lopez, Maria" -> "Maria Lopez"
+    return f"{m.group(2)} {m.group(1)}" if m and " " not in m.group(1).strip() else n
+def is_full_name(n): return len(n.split()) >= 2
+ROLE_LOCAL = set("info sales team hello hi office admin accounts accounting billing studio contact press hr jobs careers booking bookings events print marketing support help service orders mail email reply news media design production producer creative art photo".split())
+def addr_name(ad):
+    """'patrick.casani@x' -> 'Patrick Casani' (only first.last / first_last shapes, never role mailboxes)"""
+    m = re.match(r"^([a-z]{2,})[._]([a-z]{2,})$", ad.split("@")[0].lower())
+    return "" if not m or m.group(1) in ROLE_LOCAL or m.group(2) in ROLE_LOCAL else f"{m.group(1).title()} {m.group(2).title()}"
+def sig_name(sig, addr):
+    """the sender's name line from their signature block; must match the address or sit right under the sign-off"""
+    loc = re.sub(r"[^a-z]", "", addr.split("@")[0].lower()); first = None
+    for i, l in enumerate([x.strip(" \t|·•-–—,") for x in (sig or "").split("\n") if x.strip()][:6]):
+        if CLOSER.match(l): continue
+        if first is None: first = i
+        if TITLE.search(l) or PHONE.search(l) or "@" in l or SITE.search(l) or len(l) > 40 or COMPANYISH.search(l) or not SIG_NAME.match(l): continue
+        toks = [re.sub(r"[^a-z]", "", t.lower()) for t in l.split()]
+        if any(len(t) >= 3 and t in loc for t in toks) or i == first: return l
+    return ""
+def is_contact_addr(ad):
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[a-z]{2,}$", ad or "")) and not NOISE_LOCAL.match(ad.split("@")[0]) and dom_of(ad) not in ESP and not NOREPLY_ANY.search(ad.split("@")[0]) and not is_listcmd(ad) and not ad.endswith("@privaterelay.appleid.com")
+SIG_JUNK = re.compile(r"pronoun|\b(he|she|they)/(him|her|them)\b|privacy|confidential|disclaimer|unsubscribe|intended recipient|this (e-?mail|message)|sent from|view (in|this)|click|copyright|©|all rights reserved|[:\[\]{}<>]|\.\s+\w", re.I)
+def clean_org(x):
+    """a signature company value, or '' when it is a footer line or really a job title"""
+    x = re.sub(r"\s+", " ", (x or "").strip(" *_,.|")).strip()
+    if not x or len(x) > 60 or SIG_JUNK.search(x) or (TITLE.search(x) and not COMPANYISH.search(x)): return ""
+    return x
+def clean_title(x):
+    x = re.sub(r"\s+", " ", (x or "").strip(" *_,.|")).strip()
+    parts = [p.strip() for p in re.split(r"\s+\|\s+", x)]
+    if len(parts) == 2 and SIG_NAME.match(parts[0]) and not TITLE.search(parts[0]): x = parts[1]     # "Jo Smith | SVP, Sales" -> "SVP, Sales"
+    return "" if not x or len(x) > 70 or SIG_JUNK.search(x) or x[0].islower() and len(x) > 25 else x
+# ---- who is buying: per message, did the sender OFFER a price document (quote / estimate / bid / invoice / proposal) or REQUEST one?
+TRADE_DOC = r"(quote|quotation|estimate|bid|invoice|proposal)"
+OFFER = re.compile(r"\b" + TRADE_DOC + r"s?\b[^.?!\n]{0,80}?\$\s?\d|\$\s?\d[\d,.]*k?\b[^.?!\n]{0,40}\b(quote|estimate|bid)\b|\b" + TRADE_DOC + r"s?\s+(is\s+|are\s+)?attached\b|\battached\s+(is\s+|are\s+)?(the\s+|our\s+|my\s+|an?\s+)?" + TRADE_DOC
+                   + r"|\binvoice\s*(#|no\.?\s*|number\s*)?\d{3,}|\bhere(?:'s| is| are)\s+(the\s+|our\s+|my\s+|an?\s+)?" + TRADE_DOC, re.I)
+REQUEST = re.compile(r"\b(can|could|would|will) you\b[^.?!\n]{0,30}?\b(quote|bid|estimate|price)\b|\b(can|could|would|will) you\b[^.?!\n]{0,30}?\bsend\b[^.?!\n]{0,20}?\b" + TRADE_DOC
+                     + r"|\b(quote|bid|estimate)s? please\b|\bplease (bid|quote)\b|\bplease send\b[^.?!\n]{0,20}?\b" + TRADE_DOC
+                     + r"|\b(would like|need|want|looking for|requesting|request)\s+(a |an |your |the )?(quote|estimate|bid|proposal|pricing)\b|\b(quote|bid)\?|\bquote request\b|\brfq\b", re.I)
+TRADE_ATT = re.compile(r"(?<![a-z])(quote|quotation|estimate|invoice|inv[-_ ]?\d|proposal|bid)(?![a-z])", re.I)
+def trade_acts(text, atts):
+    """-> (offer_kind or '', request_kind or '') for one message's own new text (quoted history already removed) and attachment names"""
+    t = (text or "")[:4000]; o = OFFER.search(t); q = REQUEST.search(t)
+    a = next((TRADE_ATT.search(n).group(1).lower() for n in atts if TRADE_ATT.search(n or "")), "")
+    kind = lambda m: next((g.lower() for g in m.groups() if g and re.fullmatch(TRADE_DOC, g, re.I)), "quote")
+    offer = "invoice" if a.startswith("inv") else (a or (kind(o) if o else ""))
+    return (offer if offer and not (q and not a and q.start() < (o.start() if o else 10**9)) else ""), (kind(q) if q else "")
+def build_trade(db, selfs):
+    """fills the trade table: actor 'david' or a contact address, act 'sells' / 'buys', counterpart = the other side"""
+    db.execute("delete from trade"); people = {r[0] for r in db.execute("select addr from contacts")}
+    rcpt = collections.defaultdict(list)
+    for r in db.execute("select a.mid, a.addr from addrs a join messages m on m.id=a.mid where m.decision='keep' and a.role in ('to','cc')"): rcpt[r[0]].append(r[1])
+    rows = []
+    for m in db.execute("select m.id, m.thread, m.is_sent, m.from_addr, m.att, b.text from messages m join bodies b on b.mid=m.id where m.decision='keep' and m.thread is not null"):
+        offer, req = trade_acts(m["text"], [x.get("name") or "" for x in json.loads(m["att"] or "[]")])
+        if not (offer or req): continue
+        others = [x for x in rcpt[m["id"]] if x in people and x not in selfs]
+        if m["is_sent"]:     # David offered -> recipients buy from David; David asked -> recipients sell to David
+            for x in others:
+                if offer: rows.append((m["id"], m["thread"], "david", "sells", offer, x))
+                if req: rows.append((m["id"], m["thread"], "david", "buys", req, x))
+        elif m["from_addr"] in people:
+            if offer: rows.append((m["id"], m["thread"], m["from_addr"], "sells", offer, "david"))
+            if req: rows.append((m["id"], m["thread"], m["from_addr"], "buys", req, "david"))
+    db.executemany("insert or ignore into trade values(?,?,?,?,?,?)", rows); return len(rows)
+def trade_views(db):
+    """-> ({tid: (label, evidence)}, {addr: (threads they buy in, threads they sell in)})"""
+    T = collections.defaultdict(lambda: {"sold": False, "bought": False, "ev": []}); buy, sell = collections.defaultdict(set), collections.defaultdict(set)
+    if not has_table(db, "trade"): return {}, {}
+    for r in db.execute("select * from trade order by mid"):
+        e = T[r["tid"]]; who = "David" if r["actor"] == "david" else r["actor"]
+        david_sells = (r["actor"] == "david") == (r["act"] == "sells")
+        if david_sells: e["sold"] = True; buy[r["counterpart"] if r["actor"] == "david" else r["actor"]].add(r["tid"])
+        else: e["bought"] = True; sell[r["counterpart"] if r["actor"] == "david" else r["actor"]].add(r["tid"])
+        ev = f"msg {r['mid']}: {who} {'sent' if r['act'] == 'sells' else 'asked for'} {r['what']}"
+        if ev not in e["ev"]: e["ev"].append(ev)
+    lab = {t: ("both" if e["sold"] and e["bought"] else ("they buy from David" if e["sold"] else "David buys from them"), "; ".join(e["ev"][:6])) for t, e in T.items()}
+    return lab, {ad: (len(buy[ad]), len(sell[ad])) for ad in set(buy) | set(sell)}
+CC_MAX = 10   # people who were only CC'd count as contacts only on conversations this small
+def org_label(d): return d.split(".")[0].replace("-", " ").title() if d and d not in FREE else ""
 def cmd_link(a):
-    db = opendb(a.db); selfs = set(json.loads(meta_get(db, "self", "[]"))); cut = NOW - 730 * 86400
-    A = collections.defaultdict(lambda: {"names": collections.Counter(), "in": 0, "out": 0, "first": 1 << 60, "last": 0, "lin": 0, "lout": 0, "sender_ts": []})
-    for r in db.execute("select a.addr,a.name,a.role,m.ts,m.is_sent from addrs a join messages m on m.id=a.mid where m.decision in ('keep','seed')"):
+    """Contacts = people. An address counts if they wrote to David, David wrote to them, or they were CC'd on a small
+    conversation that David or a two-way contact took part in. Shared inboxes (info@, hello@ ...) David wrote to are kept
+    as kind='shared' so they show up under their company; other shared inboxes and automated senders are dropped."""
+    db = opendb(a.db); stage(db, "link", "running"); selfs = set(json.loads(meta_get(db, "self", "[]")))
+    C = {}; T = collections.defaultdict(set); t_david = set(); t_from = collections.defaultdict(set)
+    for r in db.execute("select a.addr,a.name,a.role,m.ts,m.is_sent,m.thread from addrs a join messages m on m.id=a.mid where m.decision='keep' and m.thread is not null"):
         ad = r["addr"]
-        if ad in selfs or NOISE_LOCAL.match(ad.split("@")[0]) or dom_of(ad) in ESP: continue
-        x = A[ad]
-        if r["name"]: x["names"][r["name"]] += 1
-        x["first"] = min(x["first"], r["ts"]); x["last"] = max(x["last"], r["ts"])
-        if r["role"] == "from" and not r["is_sent"]: x["in"] += 1; x["lin"] = max(x["lin"], r["ts"]); x["sender_ts"].append(r["ts"])
-        elif r["role"] in ("to", "cc") and r["is_sent"]: x["out"] += 1; x["lout"] = max(x["lout"], r["ts"])
-    sigs = collections.defaultdict(list)
-    for r in db.execute("select s.addr,s.title,s.company,s.phone,s.site,s.ts from sigs s order by s.ts"): sigs[r["addr"]].append(r)
-    par = {}
-    def find(x):
-        while par.setdefault(x, x) != x: par[x] = par[par[x]]; x = par[x]
-        return x
-    nk = collections.defaultdict(list)
-    for ad, x in A.items():
-        find(ad); best = x["names"].most_common(1)[0][0] if x["names"] else ""
-        if name_key(best): nk[name_key(best)].append(ad)
-    merged_by = {}
-    for k, ads in nk.items():
-        for p in ads[1:]:
-            q = ads[0]; xp, xq = A[p], A[q]
-            overlap = min(xp["last"], xq["last"]) - max(xp["first"], xq["first"])
-            if dom_of(p) == dom_of(q) or dom_of(p) in FREE or dom_of(q) in FREE or overlap < 180 * 86400:
-                par[find(p)] = find(q); merged_by[p] = merged_by[q] = "name"
-    groups = collections.defaultdict(list)
-    for ad in A: groups[find(ad)].append(ad)
-    # org per domain (company votes from signatures)
-    dom_co = collections.defaultdict(collections.Counter)
-    for ad, rs in sigs.items():
-        for s in rs:
-            if s["company"] and 3 <= len(s["company"]) <= 50 and not re.search(r",\s*[A-Z]{2}\b|^\d|@", s["company"]): dom_co[dom_of(ad)][s["company"]] += 1
-    def org_of(ad, ts=None):
+        if r["is_sent"]: t_david.add(r["thread"])
+        if ad in selfs or re.sub(r"\+[^@]*@", "@", ad) in selfs or not is_contact_addr(ad): continue
+        x = C.setdefault(ad, {"names": collections.Counter(), "name_ts": {}, "first": None, "last": None, "from": 0, "to": 0, "threads": set()})
+        nm = clean_name(r["name"], ad)
+        if nm: x["names"][nm] += 1; x["name_ts"][nm] = max(x["name_ts"].get(nm, 0), r["ts"] or 0)   # ties go to the most recent spelling
+        if r["ts"]: x["first"] = min(x["first"] or r["ts"], r["ts"]); x["last"] = max(x["last"] or 0, r["ts"])
+        x["threads"].add(r["thread"]); T[r["thread"]].add(ad)
+        if r["role"] == "from" and not r["is_sent"]: x["from"] += 1; t_from[r["thread"]].add(ad)
+        elif r["role"] in ("to", "cc") and r["is_sent"]: x["to"] += 1
+    two_way = {ad for ad, x in C.items() if x["from"] and x["to"]}
+    def why_drop(ad, x):
+        if is_automated(ad): return "automated or bulk-mail address"
+        if is_shared_inbox(ad): return "" if x["to"] else "shared inbox David never wrote to"
+        if x["from"] or x["to"]: return ""
+        ok = [t for t in x["threads"] if len(T[t]) <= CC_MAX and (t in t_david or t_from[t] & two_way)]
+        if not ok: return "only CC'd on large or one-way mail"
+        x["threads"] = set(ok); return ""
+    drops = collections.Counter()
+    for ad in list(C):
+        w = why_drop(ad, C[ad])
+        if w: drops[w] += 1; del C[ad]
+    latest = collections.defaultdict(dict)                              # newest usable signature value per field
+    for r in db.execute("select addr,name,title,company,phone,ts from sigs order by ts"):
+        for k, v in (("name", r["name"]), ("title", clean_title(r["title"])), ("company", clean_org(r["company"])), ("phone", r["phone"])):
+            if v: latest[r["addr"]][k] = v
+    db.execute("delete from contacts"); db.execute("delete from thread_contacts")
+    full = 0
+    for ad, x in C.items():
+        s = latest.get(ad, {}); kind = "shared" if is_shared_inbox(ad) else "person"
+        hdr = max(x["names"], key=lambda n: (is_full_name(n), x["names"][n], x["name_ts"][n])) if x["names"] else ""; sg = clean_name(s.get("name", ""), ad)
+        cands = ((hdr, "header"), (sg, "signature"), (addr_name(ad), "address"))
+        name, src = next(((n, k) for n, k in cands if n and is_full_name(n)), None) or next(((n, k) for n, k in cands if n), ("", ""))
+        full += bool(name) and is_full_name(name) and kind == "person"
         d = dom_of(ad)
-        if d in FREE:
-            co = collections.Counter(s["company"] for s in sigs.get(ad, []) if s["company"]).most_common(1)
-            return ("co:" + norm_co(co[0][0]), co[0][0], d) if co and norm_co(co[0][0]) else (None, None, d)
-        co = dom_co[d].most_common(1)
-        if co and co[0][1] >= 2 and norm_co(co[0][0]): return ("co:" + norm_co(co[0][0]), co[0][0], d)
-        return ("d:" + d, d.split(".")[0].replace("-", " ").title(), d)
-    db.execute("delete from people"); db.execute("delete from email_person"); db.execute("delete from orgs"); db.execute("delete from person_org")
-    orgs = {}; org_n = collections.Counter(); org_first = {}; org_last = {}; org_doms = collections.defaultdict(set); org_titles = collections.defaultdict(list); org_phones = collections.defaultdict(list)
-    people = []
-    for root, ads in groups.items():
-        names = collections.Counter(); [names.update(A[x]["names"]) for x in ads]
-        name = max(names, key=lambda n: (n.count(" ") > 0, names[n])) if names else ads[0].split("@")[0].replace(".", " ").title()
-        po = {}; 
-        for ad in ads:
-            for tsv in A[ad]["sender_ts"] or [A[ad]["last"]]:
-                k, nm, d = org_of(ad)
-                if not k: continue
-                e = po.setdefault(k, {"name": nm, "first": tsv, "last": tsv, "n": 0, "title": "", "tts": 0})
-                e["first"] = min(e["first"], tsv); e["last"] = max(e["last"], tsv); e["n"] += 1; org_doms[k].add(d)
-            for s in sigs.get(ad, []):
-                k, nm, d = org_of(ad)
-                if k in po and s["title"] and s["ts"] >= po[k]["tts"]: po[k]["title"] = s["title"]; po[k]["tts"] = s["ts"]
-                if k: org_titles[k].append(s["title"]); 
-                if k and s["phone"]: org_phones[k].append(s["phone"])
-        order = sorted(po.items(), key=lambda kv: kv[1]["last"])
-        cur = order[-1] if order else None; prev = [(k, v) for k, v in order[:-1]]
-        moved = int(bool(cur and prev and any(cur[1]["first"] > v["last"] - 90 * 86400 for _, v in prev) and sum(v["n"] for _, v in prev) >= 1 and cur[1]["n"] >= 1 and len(po) >= 2))
-        x_in = sum(A[x]["in"] for x in ads); x_out = sum(A[x]["out"] for x in ads); lin = max(A[x]["lin"] for x in ads); lout = max(A[x]["lout"] for x in ads)
-        phones = [s["phone"] for ad in ads for s in sigs.get(ad, []) if s["phone"]]
-        people.append({"name": name, "ads": sorted(ads, key=lambda x: -A[x]["last"]), "cur": cur, "prev": prev, "moved": moved, "in": x_in, "out": x_out, "first": min(A[x]["first"] for x in ads), "last": max(A[x]["last"] for x in ads),
-                       "two_way": x_in > 0 and x_out > 0, "lt": max(lin, lout) if x_in and x_out else 0, "phone": phones[-1] if phones else "", "merged": "name" if any(x in merged_by for x in ads) and len(ads) > 1 else ""})
-        for k, v in po.items():
-            org_n[k] += v["n"]; org_first[k] = min(org_first.get(k, 1 << 60), v["first"]); org_last[k] = max(org_last.get(k, 0), v["last"]); orgs.setdefault(k, v["name"])
-    oid = {}
-    for k, nm in orgs.items():
-        titles = [t for t in org_titles[k] if t]; doms = sorted(org_doms[k]); seg = segment_of(nm, " ".join(doms), titles)
-        sig = ""
-        if re.search(r"creative advertising|advertising|marketing|publicity|key art", " ".join(titles).lower()) and seg == "Network/streamer publicity": sig = "Studio creative-advertising team (Paramount pattern): commissions pitch-meeting environments"
-        cur = db.execute("insert into orgs(key,name,domains,site,segment,market,first_ts,last_ts,n,icp_signal) values(?,?,?,?,?,?,?,?,?,?)", (k, nm, ",".join(doms), doms[0] if doms and doms[0] not in FREE else "", seg, market_of(org_phones[k]), org_first[k], org_last[k], org_n[k], sig)); oid[k] = cur.lastrowid
-    for p in people:
-        cur = p["cur"]; prev = "; ".join(f"{v['name']} ({year_of(v['first'])}-{year_of(v['last'])})" for k, v in p["prev"])
-        pid = db.execute("insert into people(name,emails,org_id,title,phone,first_ts,last_ts,n_in,n_out,last_two_way,prev_orgs,moved,merged_by) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                         (p["name"], ";".join(p["ads"]), oid.get(cur[0]) if cur else None, cur[1]["title"] if cur else "", p["phone"], p["first"], p["last"], p["in"], p["out"], p["lt"], prev, p["moved"], p["merged"])).lastrowid
-        db.executemany("insert into email_person values(?,?)", [(x, pid) for x in p["ads"]])
-        for k, v in ([cur] if cur else []) + p["prev"]: db.execute("insert or ignore into person_org values(?,?,?,?,?,?)", (pid, oid[k], v["title"], v["first"], v["last"], v["n"]))
-    db.commit(); print(f"link: {len(people)} people (from {len(A)} addresses), {len(orgs)} organisations, {sum(p['moved'] for p in people)} possible job changes")
+        db.execute("insert into contacts(addr,name,name_src,company,title,phone,domain,first_ts,last_ts,n_from,n_to,n_threads,kind) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (ad, name, src, s.get("company", "") or org_label(d), s.get("title", ""), s.get("phone", ""), d, x["first"], x["last"], x["from"], x["to"], len(x["threads"]), kind))
+        db.executemany("insert into thread_contacts values(?,?)", [(t, ad) for t in x["threads"]])
+    n_trade = build_trade(db, selfs)
+    db.commit(); src_n = dict(db.execute("select name_src, count(*) from contacts where kind='person' group by 1").fetchall())
+    n_p = sum(src_n.values()); n_s = len(C) - n_p
+    stage(db, "link", "done", f"{n_p} contacts")
+    print(f"contacts: {n_p} people ({full} with a full name; names from headers {src_n.get('header', 0)}, signatures {src_n.get('signature', 0)}, address shape {src_n.get('address', 0)}; no name {src_n.get('', 0)})"
+          f" + {n_s} shared company inboxes David wrote to | left out: " + (", ".join(f"{n} {w}" for w, n in drops.most_common()) or "none") + f" | quote/invoice signals: {n_trade}")
 
-# ---------------------------------------------------------------- STAGE 6: per-thread classification (heuristic | scaledown | openai-compatible), cached
-PV = "v1"
-STAGES = ["inquiry", "bid", "booked", "in-progress", "delivered", "invoiced", "paid"]
-STAGE_RX = [("paid", r"payment (has been )?(received|sent)|paid in full|wire (sent|went out)|check (is )?(in the mail|mailed|cut)|thank you for (the|your) payment|received your payment|payment confirmed"),
-            ("invoiced", r"invoice (attached|#|no\.?|number)|attached (is )?(the |my |our )?invoice|please find (the |my )?invoice|net ?(30|15|45)|balance due|remit"),
-            ("delivered", r"\bdelivered\b|\binstalled\b|\bwrapped\b|strike (complete|done)|arrived safely|it arrived|picked up|shipped (out|today)|tracking number"),
-            ("in-progress", r"\bbuilding\b|fabricat|load[- ]?in|in progress|shoot day|call sheet|\bpaint(ing|ed)\b|\bshop (is|has)|build (schedule|update)|work in progress|progress photos"),
-            ("booked", r"you got the job|we('re| are) (good|moving forward|confirmed)|confirmed|booked|awarded|green ?light|approved|purchase order|\bpo\b ?(#|number|attached)|signed (the )?(deal memo|agreement|contract)|deal memo|go ahead"),
-            ("bid", r"\bquote\b|estimate|\bbid\b|proposal|pricing|budget (for|of|is)|ballpark|rough number|cost (to|for)"),
-            ("inquiry", r"are you available|availability|hold (the )?dates?|interested in|looking for a (set|production)|reaching out|can you (design|build)|would you be able")]
-KIND_RX = [("trophy", "Event/activation", r"trophy|award|activation|event\b"), ("conference room", "Broadcast/studio", r"conference room|boardroom|pitch meeting|marketing meeting"), ("key art", "Publicity/key art", r"key.?art|publicity|premiere|poster shoot"),
-           ("commercial", "Commercial", r"commercial|\bspot\b|tv spot|airport|product shoot"), ("campaign", "Ad campaign", r"campaign|lookbook"), ("editorial", "Editorial", r"editorial|cover shoot|magazine"),
-           ("retail", "Retail/trade show", r"trade ?show|retail|window display|booth"), ("music", "Music", r"album|music video|tour")]
-DELIV = [("trophy", r"trophy"), ("conference room set/environment", r"conference room|boardroom"), ("backdrop", r"backdrop"), ("set build", r"set build|build the set|set design|\bset\b"), ("props", r"\bprops?\b"), ("renderings", r"render(ing)?s?"), ("drawings/floor plan", r"drawings?|floor ?plan|elevations?"),
-         ("mood board / references", r"mood ?board|reference images?"), ("fabrication", r"fabricat"), ("install / load-in", r"install|load[- ]?in"), ("delivery/shipping", r"deliver(y|ed)|shipp(ed|ing)|crate"), ("strike", r"\bstrike\b"), ("3D model / SketchUp", r"sketch ?up|3d model|\.skp"), ("signage/graphics", r"signage|graphics|vinyl|logo")]
-ROLE_RX = re.compile(r"(production designer|set designer|art director|set decorator|prop master|lead designer|design (and|&) build|designer and fabricator|creative director)", re.I)
-MONEY = re.compile(r"\$\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{2}))?\s?([kK])?\b")
-def money_items(text, date=""):
-    out = []
-    for m in MONEY.finditer(text):
-        v = float(m.group(1).replace(",", "")) * (1000 if m.group(3) else 1) + (int(m.group(2)) / 100 if m.group(2) else 0)
-        ctx = text[max(0, m.start() - 70): m.end() + 50].replace("\n", " ").strip(); lc = ctx.lower()
-        near = {}; a0, a1 = m.start() - max(0, m.start() - 70), m.end() - max(0, m.start() - 70)
-        for kind, rx in (("payment", r"paid|payment|wire|check|received"), ("deposit", r"deposit"), ("invoice", r"invoice|inv\b|balance due|net ?30"), ("quote", r"quote|estimate|bid|proposal|price|pricing|cost"), ("budget", r"budget")):
-            for mm in re.finditer(rx, lc):
-                d = a0 - mm.end() if mm.end() <= a0 else mm.start() - a1 + 25
-                near[kind] = min(near.get(kind, 999), max(d, 0))
-        k = min(near, key=near.get) if near else "mention"
-        out.append({"kind": k, "amount": v, "date": date, "evidence": ctx[:140]})
-    return out
-def build_digest(db, tid, selfs, per=1500, cap=12000):
-    L = []; ms = db.execute("select m.id,m.ts,m.from_addr,m.from_name,m.subject,m.att,m.is_sent,b.text from messages m left join bodies b on b.mid=m.id where m.thread=? order by m.ts", (tid,)).fetchall()
-    for m in ms:
-        who = "DAVID" if m["is_sent"] else (m["from_name"] or m["from_addr"]); atts = [x["name"] for x in json.loads(m["att"] or "[]") if x.get("name")]
-        L.append(f"[{ymd(m['ts'])}] {who} <{m['from_addr']}>: {m['subject']}" + (f" (attachments: {', '.join(atts[:6])})" if atts else "") + "\n" + (m["text"] or "")[:per])
-    return "\n\n".join(L)[:cap], ms
-def org_by_addr(db, addr):
-    d = dom_of(addr)
-    if d and d not in FREE:
-        r = db.execute("select name from orgs where ','||domains||',' like ?", ("%," + d + ",%",)).fetchone()
-        if r: return r[0]
-    r = db.execute("select o.name from email_person e join people p on p.id=e.pid join orgs o on o.id=p.org_id where e.addr=?", (addr,)).fetchone()
-    return r[0] if r else None
-def heuristic(db, tid, digest, ms, selfs):
-    low = digest.lower(); subj = db.execute("select subj from threads where id=?", (tid,)).fetchone()[0]
-    sc = sum(min(len(re.findall(p, low)), 3) * w for p, w in [(r"quote|estimate|\bbid\b|proposal", 2), (r"invoice|deposit|purchase order|\bpo\b", 2), (r"call sheet|load[- ]?in|strike|fabricat|install", 2), (r"set design|set build|\bset\b|props?|backdrop|trophy|conference room|render", 1), (r"shoot|commercial|campaign|key.?art|deliver", 1), (r"\$\s?\d", 1)])
-    sent = sum(1 for m in ms if m["is_sent"]); atts = sum(1 for m in ms if m["att"] and m["att"] != "[]")
-    is_proj = sc >= 4 and (sent >= 1 or atts >= 1)
-    status = ""; 
-    for st, rx in STAGE_RX:
-        if re.search(rx, low): 
-            if not status or STAGES.index(st) > STAGES.index(status): status = st
-    if re.search(r"went with (someone|another)|not moving forward|passed on|no longer need|cancel(l)?ed|budget fell through", low) and status in ("", "inquiry", "bid"): status = "lost"
-    money = []
-    for m in ms: money += money_items((m["text"] or ""), ymd(m["ts"]))
-    ptype = next((t for kw, t, rx in KIND_RX if re.search(rx, low)), "")
-    deliv = [lab for lab, rx in DELIV if re.search(rx, low)]
-    role = ROLE_RX.search(" ".join((m["text"] or "") for m in ms if m["is_sent"])) or ROLE_RX.search(digest)
-    ppl = []; seen = set()
-    for m in ms:
-        ad = m["from_addr"]
-        if ad in seen or ad in selfs: continue
-        seen.add(ad); s = db.execute("select title, company from sigs where addr=? and title!='' order by ts desc limit 1", (ad,)).fetchone()
-        ppl.append({"name": m["from_name"], "email": ad, "role": s["title"] if s else ""})
-    orgc = collections.Counter()
-    for p in ppl:
-        r = org_by_addr(db, p["email"])
-        if r: orgc[r] += 1
-    first = ms[0]; ex = " ".join(re.split(r"(?<=[.!?])\s+", (first["text"] or "").strip())[:2])[:300]
-    return {"is_project": bool(is_proj), "kind": "project_work" if is_proj else "other", "client": orgc.most_common(1)[0][0] if orgc and is_proj else "", "brand": "", "project_name": (subj or "").strip().title()[:90], "year": year_of(first["ts"]),
-            "role": role.group(1).lower() if role else "", "deliverables": deliv, "money": money[:25], "status": status or "unknown", "type": ptype, "people": ppl[:12], "summary": f"{len(ms)} message(s) {ymd(ms[0]['ts'])} to {ymd(ms[-1]['ts'])}. Opening: {ex}", "confidence": round(min(1.0, sc / 10), 2), "source": "heuristic", "score": sc}
-
-def http_json(url, body, headers, timeout=120, retries=5):
-    data = json.dumps(body).encode(); last = None
-    for i in range(retries):
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url, data, {"Content-Type": "application/json", **headers}, method="POST"), timeout=timeout) as r: return json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            last = f"HTTP {e.code}: {e.read()[:200]!r}"
-            if e.code in (429, 500, 502, 503, 504): time.sleep(2 ** i); continue
-            raise RuntimeError(last)
-        except (urllib.error.URLError, socket.timeout, ConnectionError) as e: last = str(e); time.sleep(2 ** i)
-    raise RuntimeError("LLM API failed: " + str(last))
-def grounded(s, text): return bool(s) and re.sub(r"\W+", " ", str(s).lower()).strip() in re.sub(r"\W+", " ", text.lower())
-KIND_LABELS = [("project_work", "Does this email thread discuss a paid creative production job, such as designing, building, fabricating, delivering or installing a set, props, trophy or display, including quotes, schedules, invoices or payments for it?"),
-               ("project_inquiry", "Is this email thread an inquiry, request for availability, bid or proposal for a possible set design or production job?"),
-               ("payment_admin", "Is this email thread mainly about an invoice, payment, tax form or other bookkeeping?"),
-               ("solicitation", "Is this email thread an unsolicited sales pitch, promotion or mass announcement?"),
-               ("personal", "Is this email thread a personal or family conversation unrelated to work?"),
-               ("other_business", "Is this email thread professional correspondence that is not about a specific job, such as networking or general updates?")]
-STATUS_LABELS = [("inquiry", "Is the work only being asked about, with no price or commitment yet?"), ("bid", "Has a quote, estimate or proposal been given but not yet accepted?"), ("booked", "Has the client confirmed or approved the job, or issued a purchase order?"),
-                 ("in_progress", "Is the set or object currently being designed, built or prepared?"), ("delivered", "Has the work been delivered, installed or shot and wrapped?"), ("invoiced", "Has an invoice been sent and is payment pending?"), ("paid", "Has payment been received and the job closed?"), ("lost", "Did the client decline, cancel or choose someone else?")]
-class SD:
-    name = "scaledown"
-    def __init__(s): s.key = os.environ["SCALEDOWN_API_KEY"]; s.base = os.environ.get("SCALEDOWN_BASE", "https://api.scaledown.xyz").rstrip("/"); s.h = {"x-api-key": s.key}
-    def classify(s, items, labels):
-        out = {}
-        for i in range(0, len(items), 50):
-            r = http_json(s.base + "/classify", {"chunks": [{"id": str(k), "text": t} for k, t in items[i:i + 50]], "labels": [{"name": n, "rubric": q} for n, q in labels]}, s.h)
-            for x in r.get("results", []): out[x["id"]] = (x.get("top_label"), (x.get("scores") or {}).get(x.get("top_label"), 0))
-        return out
-    def extract(s, text):
-        sch = {"type": "object", "properties": {"client_company": {"type": "string", "description": "Name of the company or brand that hired the designer or is the customer for the job"}, "project_name": {"type": "string", "description": "Title of the project, job, film, commercial or campaign"},
-               "person": {"type": "string", "description": "Full name of a person"}, "money_amount": {"type": "string", "description": "Dollar amount"}, "deliverable": {"type": "string", "description": "Physical item, set or object the designer must design, build or deliver"}, "designer_role": {"type": "string", "description": "Job title or role the designer was hired for"}}}
-        r = http_json(s.base + "/v1/chat/completions", {"model": "extract", "messages": [{"role": "user", "content": text}], "response_format": {"type": "json_schema", "json_schema": {"name": "project", "schema": sch}}}, s.h)
-        ents = json.loads(r["choices"][0]["message"]["content"]).get("entities", []); g = collections.defaultdict(list)
-        for e in ents: g[e["type"]].append((e.get("confidence", 0), e["text"]))
-        return {k: [t for _, t in sorted(v, reverse=True)] for k, v in g.items()}
-    def summarize(s, text):
-        r = http_json(s.base + "/v1/chat/completions", {"model": "summarize", "max_tokens": 300, "messages": [{"role": "system", "content": "Summarize this email thread about a set design or production job in 3 sentences: client, what was designed or built, dates, money and status. Use only facts stated in the thread."}, {"role": "user", "content": text}]}, s.h)
-        return json.loads(r["choices"][0]["message"]["content"]).get("summary", "")
-    def run(s, batch):  # batch: [(tid, digest, heur)]
-        kinds = s.classify([(t, d) for t, d, h in batch], KIND_LABELS); res = {}
-        proj = [(t, d) for t, d, h in batch if kinds.get(str(t), ("",))[0] in ("project_work", "project_inquiry", "payment_admin")]
-        stat = s.classify(proj, STATUS_LABELS) if proj else {}
-        for t, d, h in batch:
-            k = kinds.get(str(t), (None, 0)); o = {"kind": k[0], "confidence": round(float(k[1] or 0), 2), "is_project": k[0] in ("project_work", "project_inquiry")}
-            if str(t) in stat: o["status"] = stat[str(t)][0].replace("_", "-")
-            if k[0] in ("project_work", "project_inquiry", "payment_admin"):
-                e = s.extract(d); o["client"] = (e.get("client_company") or [""])[0]; o["project_name"] = (e.get("project_name") or [""])[0]; o["role"] = (e.get("designer_role") or [""])[0]
-                o["deliverables"] = e.get("deliverable", [])[:8]; o["people_names"] = e.get("person", [])[:12]; o["amounts"] = e.get("money_amount", [])[:15]; o["summary"] = s.summarize(d)
-            res[t] = o
-        return res
-class OA:
-    name = "openai"
-    def __init__(s):
-        s.base = os.environ["LLM_BASE_URL"].rstrip("/"); s.model = os.environ.get("LLM_MODEL", "llama3.1:8b"); s.h = {"Authorization": "Bearer " + os.environ.get("LLM_API_KEY", "none")}
-    def run(s, batch):
-        res = {}; sysm = ("You extract facts from one email thread for a set designer's CRM. Reply with ONE JSON object only: {\"kind\": one of project_work|project_inquiry|payment_admin|solicitation|personal|other_business, \"is_project\": bool, \"client\": str, \"brand\": str, \"project_name\": str, \"year\": int, \"role\": str, \"deliverables\": [str], "
-               "\"money\": [{\"kind\": quote|invoice|payment|deposit|budget, \"amount\": number, \"date\": \"YYYY-MM-DD\", \"evidence\": exact quote from thread}], \"status\": inquiry|bid|booked|in-progress|delivered|invoiced|paid|lost|unknown, \"people\": [{\"name\": str, \"role\": str}], \"summary\": 3 sentences}. Use ONLY facts in the thread; use \"\" or [] when absent. Never guess amounts.")
-        for t, d, h in batch:
-            d2 = compress(d, "Extract project facts") if len(d) > 8000 else d
-            body = {"model": s.model, "temperature": 0, "messages": [{"role": "system", "content": sysm}, {"role": "user", "content": d2}], "response_format": {"type": "json_object"}}
-            try: r = http_json(s.base + "/chat/completions", body, s.h)
-            except RuntimeError: body.pop("response_format"); r = http_json(s.base + "/chat/completions", body, s.h)
-            txt = r["choices"][0]["message"]["content"]; m = re.search(r"\{.*\}", txt, re.S)
-            try: res[t] = json.loads(m.group(0)) if m else {}
-            except Exception: res[t] = {}
-        return res
-def compress(text, prompt):
-    k = os.environ.get("SCALEDOWN_API_KEY")
-    if not k: return text
-    try:
-        r = http_json(os.environ.get("SCALEDOWN_BASE", "https://api.scaledown.xyz").rstrip("/") + "/compress/raw/", {"context": text, "prompt": prompt, "scaledown": {"rate": "auto"}}, {"x-api-key": k})
-        return (r.get("results") or r).get("compressed_prompt") or text
-    except Exception: return text
-def pick_backend(a):
-    b = a.backend
-    if b == "auto": b = "scaledown" if os.environ.get("SCALEDOWN_API_KEY") else "openai" if os.environ.get("LLM_BASE_URL") else "heuristic"
-    return None if b == "heuristic" else SD() if b == "scaledown" else OA()
-def merge_llm(h, o, digest):
-    r = dict(h); r["source"] = h["source"]
-    if not o: return r
-    r["source"] = "+".join([h["source"], o.get("_n", "llm")]) if "_n" in o else h["source"] + "+llm"
-    if o.get("kind"): r["kind"] = o["kind"]; r["is_project"] = bool(o.get("is_project", o["kind"] in ("project_work", "project_inquiry")))
-    for k in ("client", "brand", "project_name", "role"):
-        if o.get(k) and grounded(o[k], digest): r[k] = o[k]
-    if o.get("status") and o["status"] in STAGES + ["lost", "unknown"]: r["status"] = o["status"]
-    if o.get("deliverables"): r["deliverables"] = sorted(set(r["deliverables"]) | {d for d in o["deliverables"] if grounded(d, digest)})
-    if o.get("money"):
-        ok = [m for m in o["money"] if isinstance(m, dict) and m.get("amount") and re.search(r"\b" + re.escape(f"{int(float(m['amount'])):,}") + r"\b|\b" + str(int(float(m["amount"]))) + r"\b", digest)]
-        if ok: r["money"] = [dict(m, evidence=str(m.get("evidence", ""))[:140]) for m in ok]
-    if o.get("amounts") and not o.get("money"):
-        keep = [m for m in r["money"] if any(re.sub(r"\D", "", str(x)) == str(int(m["amount"])) for x in o["amounts"])]
-        r["money"] = keep or r["money"]
-    if o.get("people"): r["people"] = [dict(p, email=p.get("email", "")) for p in o["people"] if grounded(p.get("name"), digest)] or r["people"]
-    if o.get("summary") and len(o["summary"]) > 20: r["summary"] = o["summary"].strip()
-    if o.get("confidence"): r["confidence"] = max(r["confidence"], o["confidence"])
-    if o.get("year"): r["year"] = r["year"] or o["year"]
-    return r
-def classify_threads(db, a, tids=None, quiet=False):
-    selfs = set(json.loads(meta_get(db, "self", "[]"))); be = pick_backend(a); bname = be.name if be else "heuristic"
-    q = "select id from threads" if tids is None else "select id from threads where id in (%s)" % ",".join(map(str, tids or [0]))
-    todo = []; chars = 0
-    for (tid,) in db.execute(q).fetchall():
-        digest, ms = build_digest(db, tid, selfs)
-        if not any(m["text"] for m in ms) and not any(m["att"] not in (None, "[]") for m in ms): continue
-        h = heuristic(db, tid, digest, ms, selfs); hh = hashlib.sha1((digest + PV).encode()).hexdigest()
-        c0 = db.execute("select hash from tclass where tid=? and backend=?", (tid, bname)).fetchone()
-        if c0 and c0[0] == hh and not a.force: continue
-        db.execute("insert or replace into tclass values(?,?,?,?,?,?)", (tid, "heuristic", hh, PV, json.dumps(h), time.time()))
-        if be and (h["score"] >= a.min_score or a.all): todo.append((tid, digest, h, hh)); chars += len(digest)
-        elif be: pass
-    db.commit(); n_h = db.execute("select count(*) from tclass where backend='heuristic'").fetchone()[0]
-    if not quiet: print(f"classify: heuristic done for {n_h} threads; backend={bname}; {len(todo)} threads queued for the model ({chars:,} digest chars)")
-    if a.dry_run or not be: return
-    todo = todo[:a.max_threads]
-    for i in range(0, len(todo), a.llm_batch):
-        b = todo[i:i + a.llm_batch]; res = be.run([(t, d, h) for t, d, h, _ in b])
-        for t, d, h, hh in b:
-            o = res.get(t) or {}; o["_n"] = bname; db.execute("insert or replace into tclass values(?,?,?,?,?,?)", (t, bname, hh, PV, json.dumps(merge_llm(h, o, d)), time.time()))
-        db.commit(); 
-        if not quiet: log(f"classify: {min(i + a.llm_batch, len(todo))}/{len(todo)} threads via {bname}")
-def get_class(db, tid):
-    r = db.execute("select js from tclass where tid=? order by case backend when 'heuristic' then 1 else 0 end limit 1", (tid,)).fetchone()
-    return json.loads(r[0]) if r else None
-def cmd_classify(a): classify_threads(db := opendb(a.db), a)
-
-# ---------------------------------------------------------------- STAGE 7: projects + exports (Notion-ready CSVs)
-STOP = set("re fwd fw update updated final revised revision new the a an and of for to with from on in at v1 v2 v3 quote estimate invoice schedule attached info thanks follow up question request".split())
+# ---------------------------------------------------------------- STAGE 6: projects = threads about the same job, with the same people
+STOP = set("re fwd fw aw update updated final revised revision new the a an and of for to with from on in at v1 v2 v3 attached info thanks thank you follow up question request hi hello hey please quick call today tomorrow quote estimate invoice schedule bid".split())
+WORK_WORDS = re.compile(r"\b(?:" + SUBJ_PROJECT.pattern[1:-1] + ")", re.I)
 def ptoks(name): return {w for w in re.findall(r"[a-z]{3,}", (name or "").lower()) if w not in STOP}
-NSTATUS = {"inquiry": "Bidding", "bid": "Bidding", "booked": "Booked", "in-progress": "Build", "delivered": "Wrap", "invoiced": "Invoiced", "paid": "Paid", "lost": "Bidding", "unknown": ""}
-def build_projects(db):
-    items = []
-    for r in db.execute("select t.id,t.subj,t.first_ts,t.last_ts,t.n from threads t"):
-        c = get_class(db, r["id"])
-        if c and c["is_project"] and c["kind"] in ("project_work", "project_inquiry", "other"): items.append((r, c))
-    by_client = collections.defaultdict(list)
-    for r, c in items: by_client[c["client"] or "(client not found in email)"].append((r, c))
-    projects = []
-    for client, lst in by_client.items():
-        clusters = []
-        for r, c in sorted(lst, key=lambda x: x[0]["first_ts"]):
-            tk = ptoks(c["project_name"]) or ptoks(" ".join(c["deliverables"]))
-            for cl in clusters:
-                if tk and cl["tk"] and (len(tk & cl["tk"]) / len(tk | cl["tk"]) >= 0.5 or len(tk & cl["tk"]) >= 3): cl["items"].append((r, c)); cl["tk"] |= tk; break
-            else: clusters.append({"tk": tk, "items": [(r, c)]})
-        for cl in clusters:
-            its = cl["items"]; names = collections.Counter(re.sub(r"\b(19|20)\d\d\b", "", c["project_name"]).strip(" -:") for _, c in its)
-            yrs = sorted({year_of(r["first_ts"]) for r, _ in its}); best = max((c["status"] for _, c in its if c["status"] in STAGES + ["lost"]), key=lambda s: STAGES.index(s) if s in STAGES else -1, default="unknown")
-            pname = names.most_common(1)[0][0] or its[0][0]["subj"]
-            if len(yrs) >= 2 or len({c["project_name"] for _, c in its}) >= 3:
-                nm_l = [re.sub(r"\b(19|20)\d\d\b", "", c["project_name"]).split() for _, c in its]; common = [w for w in nm_l[0] if all(w.lower() in [x.lower() for x in n] for n in nm_l[1:])]
-                if len(common) >= 2: pname = " ".join(common).strip(" -:")
-            occ = []
-            for y in yrs:
-                sub = [(r, c) for r, c in its if year_of(r["first_ts"]) == y]
-                mx = lambda kind: sum(max([m["amount"] for m in c["money"] if m["kind"] == kind] or [0]) for _, c in sub)
-                st = max((c["status"] for _, c in sub if c["status"] in STAGES), key=STAGES.index, default="unknown")
-                dn = " ".join(w for w in re.sub(r"\b(19|20)\d\d\b", "", sub[0][1]["project_name"]).split() if w.lower() not in pname.lower().split()).strip(" -:") if len(sub) == 1 else ""
-                occ.append({"label": (f"{pname} - {dn} {y}" if dn else f"{pname} {y}"), "year": y, "threads": [r["id"] for r, _ in sub], "status": st, "quoted": mx("quote"), "invoiced": mx("invoice"), "paid": mx("payment") + mx("deposit"), "summary": " ".join(c["summary"] for _, c in sub[:2])[:600]})
-            ty = collections.Counter(c["type"] for _, c in its if c["type"]).most_common(1)
-            projects.append({"name": pname, "client": client, "type": ty[0][0] if ty else "", "status": best, "years": yrs, "recurring": len(yrs) >= 2, "occurrences": occ,
-                             "quoted": sum(o["quoted"] for o in occ), "invoiced": sum(o["invoiced"] for o in occ), "paid": sum(o["paid"] for o in occ), "deliverables": sorted({d for _, c in its for d in c["deliverables"]}),
-                             "people": sorted({p.get("name") or p.get("email", "") for _, c in its for p in c["people"] if p.get("name") or p.get("email")}), "threads": [(r["id"], r["subj"], r["first_ts"], r["last_ts"], r["n"], c["status"], c["summary"]) for r, c in its]})
-    return projects
-def cmd_export(a):
-    db = opendb(a.db); os.makedirs(a.out, exist_ok=True); selfs = set(json.loads(meta_get(db, "self", "[]"))); projects = build_projects(db)
-    known = [x.strip().lower() for x in open(a.clients).read().splitlines() if x.strip()] if a.clients and os.path.exists(a.clients) else []
-    W = lambda name, hdr, rows: csv.writer(open(os.path.join(a.out, name), "w", newline="", encoding="utf-8")).writerows([hdr] + rows)
-    pc_org = collections.Counter(); proj_by_org = collections.defaultdict(list); pc_person = set()
-    for p in projects:
-        if p["status"] in ("booked", "in-progress", "delivered", "invoiced", "paid") or p["paid"] or p["invoiced"]: pc_org[p["client"]] += 1
-        proj_by_org[p["client"]].append(p)
-        for t in p["threads"]:
-            for r in db.execute("select e.pid from addrs a join email_person e on e.addr=a.addr where a.mid in (select id from messages where thread=?)", (t[0],)): pc_person.add(r[0])
-    orgs = {r["id"]: r for r in db.execute("select * from orgs")}
-    ppl = db.execute("select * from people order by last_ts desc").fetchall()
-    rel = lambda p: ("Warm" if p["last_two_way"] >= NOW - 730 * 86400 else "Dormant") if p["n_in"] and p["n_out"] else "Cold"
-    crows, hrows, orow = [], [], []
-    keep = [p for p in ppl if (p["n_in"] + p["n_out"] >= a.min_msgs or p["id"] in pc_person) and not (p["emails"] and all(e in selfs for e in p["emails"].split(";")))]
-    org_has = collections.defaultdict(list)
-    for p in keep:
-        o = orgs.get(p["org_id"]); org_has[o["id"] if o else 0].append(p)
-        notes = []; 
-        if p["prev_orgs"]: notes.append("Previously: " + p["prev_orgs"])
-        if p["moved"]: notes.append("JOB CHANGE detected (re-engagement)")
-        if len(p["emails"].split(";")) > 1: notes.append("Other emails: " + ", ".join(p["emails"].split(";")[1:]))
-        pj = [pr["name"] for pr in projects if p["name"] in pr["people"]]
-        if pj: notes.append("Projects: " + "; ".join(pj[:5]))
-        crows.append([p["name"], o["name"] if o else "", p["title"], p["emails"].split(";")[0], p["phone"], "", rel(p), ymd(p["last_ts"]), "Email backfill", " | ".join(notes)])
-        hrows.append([p["id"], p["name"], p["emails"], o["name"] if o else "", p["title"], p["phone"], rel(p), p["n_in"], p["n_out"], ymd(p["first_ts"]), ymd(p["last_ts"]), p["prev_orgs"], p["moved"], p["merged_by"]])
-    W("contacts.csv", ["Name", "Company", "Role", "Email", "Phone", "LinkedIn", "Relationship", "Last contact", "Source", "Notes"], crows)
-    W("contacts_full.csv", ["id", "name", "emails", "company", "title", "phone", "relationship", "msgs_in", "msgs_out", "first", "last", "previous_orgs", "job_change", "merged_by"], hrows)
-    comp = []
-    for o in orgs.values():
-        if o["id"] not in org_has: continue
-        past = bool(pc_org.get(o["name"])) or any(k in (o["name"] + " " + (o["domains"] or "")).lower() for k in known)
-        n = [f"{o['n']} msgs {year_of(o['first_ts'])}-{year_of(o['last_ts'])}"] + ([o["icp_signal"]] if o["icp_signal"] else []) + ([f"Projects: {', '.join(p['name'] for p in proj_by_org.get(o['name'], [])[:5])}"] if proj_by_org.get(o["name"]) else [])
-        comp.append([o["name"], o["segment"], o["market"], "Yes" if past else "No", ("https://" + o["site"]) if o["site"] else "", " | ".join(n)])
-    W("companies.csv", ["Name", "Segment", "Market", "Past client", "Website", "Notes"], comp)
-    prow, tr = [], []
-    for p in projects:
-        st = NSTATUS.get(p["status"], ""); par = p["name"]
-        base = [p["client"], p["type"], st]
-        if p["recurring"]:
-            prow.append([par, *base, "", p["quoted"] or "", p["invoiced"] or "", "Yes", "", "", len(p["threads"]), "No", ", ".join(p["deliverables"]), "", "Parent template page (recurring: " + ", ".join(map(str, p["years"])) + ")"])
-        for o in p["occurrences"]:
-            nm = o["label"] if p["recurring"] else par
-            prow.append([nm, *base[:2], NSTATUS.get(o["status"], ""), "", o["quoted"] or "", o["invoiced"] or "", "Yes" if p["recurring"] else "No", o["year"], par if p["recurring"] else "", len(o["threads"]), "No", ", ".join(p["deliverables"]), "", o["summary"]])
-        for t in p["threads"]: tr.append([par, year_of(t[2]), t[0], ymd(t[2]), ymd(t[3]), t[4], t[1], t[5], t[6][:300]])
-    W("projects.csv", ["Project", "Client", "Type", "Status", "Budget", "Fee", "Total billed", "Recurring", "Occurrence year", "Parent project", "Source threads", "Example template", "Deliverables checklist", "Crew/vendors", "Notes"], prow)
-    W("project_threads.csv", ["Project", "Occurrence year", "Thread ID", "First date", "Last date", "Messages", "Subject", "Status", "Summary"], tr)
-    # re-engagement queue: who hired/worked with David, scored; neutral context notes, job change, dead address (-> lookup list), do-not-contact (-> excluded)
-    SIG = [("payment/invoice discussion", r"overdue|past due|late payment|payment reminder|still (waiting|haven.t received)|not (been )?paid|unpaid|second notice|balance due"), ("wording that may signal a disagreement (David to judge)", r"disput|unhappy|disappointed|unacceptable|not satisfied|refus|won'?t pay|attorney|lawyer|collections|chargeback|stop payment"), ("cancellation mentioned", r"cancel(l)?ed|cancellation")]
-    neg = collections.defaultdict(list); dead_ts = {}; email_pid = {r[0]: r[1] for r in db.execute("select addr,pid from email_person")}
-    for r in db.execute("select m.subject,m.ts,b.text,a.addr from messages m join bodies b on b.mid=m.id join addrs a on a.mid=m.id where m.decision='keep'"):
-        pid = email_pid.get(r["addr"])
-        if not pid or len(neg[pid]) >= 3: continue
-        for lab, rx in SIG:
-            if re.search(rx, (r["text"] or "") + " " + (r["subject"] or ""), re.I):
-                note = f"{lab} in {year_of(r['ts'])} thread '{re.sub(r'^\s*((re|fw|fwd)\s*:\s*)+', '', r['subject'] or '', flags=re.I)[:60]}'"
-                if not any(n.startswith(lab) and f"{year_of(r['ts'])} thread" in n for n in neg[pid]): neg[pid].append(note)
-    for r in db.execute("select m.ts,b.text from messages m join bodies b on b.mid=m.id where m.decision='bounce'"):
-        t = r["text"] or ""; ad = re.findall(r"final-recipient:\s*rfc822;\s*([^\s]+)", t, re.I) or re.findall(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", t)
-        for x in ad:
-            x = x.lower().strip("<>.,;")
-            if x not in selfs and not re.match(r"(mailer-daemon|postmaster)", x): dead_ts[x] = max(dead_ts.get(x, 0), r["ts"])
-    lastin = {r[0]: r[1] for r in db.execute("select from_addr, max(ts) from messages where is_sent=0 and decision='keep' group by from_addr")}
-    dnc = set(x.strip().lower() for x in open(os.path.join(a.out, "do-not-contact.csv")).read().replace(",", "\n").splitlines() if x.strip()) if os.path.exists(os.path.join(a.out, "do-not-contact.csv")) else set()
-    pp = collections.defaultdict(list)
-    for p in projects:
-        for oc in p["occurrences"]:
-            for tid in oc["threads"]:
-                for r in db.execute("select distinct e.pid from addrs a join email_person e on e.addr=a.addr where a.mid in (select id from messages where thread=?)", (tid,)): pp[r[0]].append((p, oc))
-    def last_words(pid, tid):
-        em = [e for e, q in email_pid.items() if q == pid]
-        r = db.execute("select b.text from messages m join bodies b on b.mid=m.id where m.thread=? and m.from_addr in (%s) order by m.ts desc limit 1" % ",".join("?" * len(em)), (tid, *em)).fetchone() if em else None
-        return re.sub(r"\s+", " ", (r[0] if r else "") or "")[:150]
-    cycle = {}
-    for p in projects:
-        if p["recurring"]:
-            mo = collections.Counter(time.strftime("%B", time.gmtime(t[2])) for t in p["threads"]).most_common(1)[0][0]; cycle[p["name"]] = f"annual project: kicks off ~{mo} ({p['years'][0]}-{p['years'][-1]})"
-    re_rows, ex_rows, lookup_rows, orow = [], [], [], []; seen_org = set()
-    scored = []
-    for p in keep:
-        o = orgs.get(p["org_id"]); mine = pp.get(p["id"], []); msgs = p["n_in"] + p["n_out"]; two = p["n_in"] and p["n_out"]
-        hired = any(pr["status"] in ("booked", "in-progress", "delivered", "invoiced", "paid") or pr["paid"] or pr["invoiced"] for pr, _ in mine)
-        vendor = bool(o and o["segment"] == "Partner/subcontractor"); age = (NOW - p["last_ts"]) / 86400 / 365; span = (p["last_ts"] - p["first_ts"]) / 86400 / 365
-        if not (hired or mine or (two and msgs >= 6)): continue
-        billed = sum(max(oc["invoiced"], oc["quoted"]) for pr, oc in {(id(pr), id(oc)): (pr, oc) for pr, oc in mine}.values())
-        score = min(msgs, 30) + (15 if two else 0) + (20 if age <= 2 else 14 if age <= 5 else 8 if age <= 10 else 3) + min(len({id(pr) for pr, _ in mine}), 5) * 4 + min(billed / 5000, 10) * 2 \
-                + (15 if o and o["segment"] and not vendor else 0) + (10 if o and o["icp_signal"] else 0) + (15 if p["moved"] else 0)
-        tier = "close" if two and (msgs >= 15 or (span >= 3 and msgs >= 8)) else "past_client" if hired else "lapsed"
-        flags = []
-        if p["moved"]: flags.append("JOB CHANGE: " + p["prev_orgs"] + " -> " + (o["name"] if o else "?"))
-        ems = p["emails"].split(";")
-        if ems and all(e in dead_ts and lastin.get(e, 0) <= dead_ts[e] for e in ems): flags.append("DEAD ADDRESS (bounced): find current address")
-        if neg.get(p["id"]): flags.append("CONTEXT (neutral, David decides): " + "; ".join(neg[p["id"]]))
-        if any(e in dnc or dom_of(e) in dnc for e in ems) or p["name"].lower() in dnc: flags.append("DO NOT CONTACT (owner list)")
-        best = max(mine, key=lambda x: (x[1]["year"], max(x[1]["invoiced"], x[1]["quoted"])), default=None)
-        mem = ""
-        if best:
-            pr, oc = best; mem = f"{oc['label']} ({oc['year']})" + (f", ~${max(oc['invoiced'], oc['quoted']):,.0f}" if max(oc["invoiced"], oc["quoted"]) else "") + (f"; their last words in that thread: \"{last_words(p['id'], oc['threads'][0])}\"" if oc["threads"] else "") + (f"; {cycle[pr['name']]}" if pr["name"] in cycle else "")
-        row = {"p": p, "o": o, "score": round(score), "tier": tier, "kind": "vendor" if vendor else "client", "pr": "A" if score >= 60 else "B" if score >= 35 else "C", "flags": flags, "mem": mem, "hired": hired, "projects": "; ".join(sorted({f"{oc['label']}" for _, oc in mine}))[:300], "span": span, "cycle": [cycle[pr["name"]] for pr, _ in mine if pr["name"] in cycle][:1]}
-        scored.append(row)
-    scored.sort(key=lambda r: -r["score"])
-    for r in scored:
-        p, o = r["p"], r["o"]; bad = [f for f in r["flags"] if f.startswith("DO NOT")]; dead = any(f.startswith("DEAD") for f in r["flags"])
-        out = [p["name"], o["name"] if o else "", p["emails"].split(";")[0], r["tier"], r["kind"], r["pr"], r["score"], rel(p), ymd(p["last_ts"]), p["n_in"] + p["n_out"], f"{r['span']:.1f}", "yes" if r["hired"] else "no", r["projects"], r["mem"], " | ".join(r["flags"]), p["emails"].replace(";", " ")]
-        if bad: ex_rows.append(out); continue
-        if dead: lookup_rows.append(out); continue
-        re_rows.append(out); key = o["id"] if o else p["id"]
-        if key in seen_org and not p["moved"] and r["tier"] != "close": continue
-        seen_org.add(key)
-        trig = ("; ".join(r["flags"]) or ("active/recent relationship" if (NOW - p["last_ts"]) < 730 * 86400 else f"quiet since {year_of(p['last_ts'])}")) + (f"; {r['cycle'][0]}" if r["cycle"] else "") + (f"; ICP: {o['icp_signal']}" if o and o["icp_signal"] else "")
-        nxt = {"close": "Draft a personal note for David to edit (DRAFT ONLY)", "past_client": "Draft a warm check-in (DRAFT ONLY)", "lapsed": "Draft a light touch (DRAFT ONLY)"}[r["tier"]]
-        val = max([max(oc["invoiced"], oc["quoted"]) for pr, oc in pp.get(p["id"], [])] or [0]) or ""
-        orow.append([f"Reconnect: {o['name'] if o else p['name']}", o["name"] if o else "", p["name"], "Identified", r["pr"], trig[:240], "", nxt, "", val, ymd(p["last_ts"]), 0])
-    hdr = ["Contact", "Company", "Email", "Tier", "Kind", "Priority", "Score", "Relationship", "Last contact", "Msgs", "Years active", "Hired/paid", "Projects", "Memory hint (from email)", "Flags", "All emails"]
-    W("reengagement.csv", hdr, re_rows); W("reengagement-excluded-dnc.csv", hdr, ex_rows); W("address-lookup.csv", hdr, lookup_rows)
-    W("pipeline.csv", ["Opportunity", "Company", "Contact", "Stage", "Priority", "Trigger", "Source URL", "Next action", "Follow-up date", "Est. value", "Last touch", "Touch count"], orow[:a.max_pipeline])
-    segs = collections.Counter(o["segment"] or "(unclassified)" for o in orgs.values() if o["id"] in org_has); rc = collections.Counter(rel(p) for p in keep)
-    md = [f"# Mining summary ({time.strftime('%Y-%m-%d')})", "", f"- Messages in db: {db.execute('select count(*) from messages').fetchone()[0]:,}; kept after noise filter: {db.execute("select count(*) from messages where decision in ('keep','seed')").fetchone()[0]:,}; threads: {db.execute('select count(*) from threads').fetchone()[0]:,}",
-          f"- Contacts exported: {len(crows)} ({dict(rc)}); companies: {len(comp)}; projects: {len(projects)} ({sum(1 for p in projects if p['recurring'])} recurring); reconnect queue: {len(re_rows)} (do-not-contact excluded: {len(ex_rows)}; dead addresses sent to current-address lookup: {len(lookup_rows)})", "- Companies by segment: " + ", ".join(f"{k} {v}" for k, v in segs.most_common()), "",
-          "## Top warm contacts"] + [f"- {r[0]} ({r[1]}) last {r[7]}" for r in crows if r[6] == "Warm"][:25] + ["", "## Top dormant contacts"] + [f"- {r[0]} ({r[1]}) last {r[7]}" for r in crows if r[6] == "Dormant"][:25] + ["", "## Re-engagement (first 25)"] + [f"- [{r[5]}/{r[3]}] {r[0]} @ {r[1]}: {r[13][:110] or r[14]}" for r in re_rows[:25]] + ["", "## Projects found"] + [f"- {p['name']} - {p['client']} - years {p['years']} - {p['status']}" for p in projects[:40]]
-    open(os.path.join(a.out, "summary.md"), "w").write("\n".join(md) + "\n")
-    # sqlite exports of projects for dossier/other tools
-    db.execute("create table if not exists projects(name text, client text, js text)"); db.execute("delete from projects")
-    db.executemany("insert into projects values(?,?,?)", [(p["name"], p["client"], json.dumps(p)) for p in projects]); db.commit()
-    print(f"export: contacts {len(crows)}, companies {len(comp)}, projects {len(projects)}, pipeline {min(len(orow), a.max_pipeline)} -> {a.out}/ (summary.md first)")
+def clean_subj(s): return re.sub(r"^\s*((re|fw|fwd|aw)\s*:\s*)+", "", s or "", flags=re.I).strip()
+def cmd_projects(a):
+    """A thread can start a project only if David took part and it shows work (work words in subject/body, or a document/drawing attachment).
+    Threads that share a contact and (nearly) the same subject words, years ignored, are one project (so an annual job is one project across years)."""
+    db = opendb(a.db); stage(db, "projects", "running")
+    tc = collections.defaultdict(set)
+    for r in db.execute("select tid, addr from thread_contacts"): tc[r[0]].add(r[1])
+    T = {}
+    for r in db.execute("select t.id, t.subj, t.first_ts, t.last_ts, t.n, sum(m.is_sent) sent, group_concat(m.att, '\x1f') atts from threads t join messages m on m.thread=t.id group by t.id"):
+        if r["id"] not in tc or not r["sent"]: continue
+        words = {w.lower() for w in WORK_WORDS.findall(r["subj"] or "")}; files = set()
+        for js in (r["atts"] or "").split("\x1f"):
+            for x in json.loads(js or "[]"):
+                if WORK_ATT.search(x.get("name") or ""): files.add(x["name"].rsplit(".", 1)[-1].lower())
+        if not words:
+            for (txt,) in db.execute("select substr(b.text,1,4000) from bodies b join messages m on m.id=b.mid where m.thread=?", (r["id"],)):
+                words |= {w.lower() for w in WORK_WORDS.findall(txt or "")}
+        if words or files: T[r["id"]] = {"r": r, "tk": ptoks(re.sub(r"\b(19|20)\d\d\b", "", clean_subj(r["subj"]))), "why": sorted(words)[:8] + [f".{f} file" for f in sorted(files)][:4]}
+    par = {t: t for t in T}
+    def find(x):
+        while par[x] != x: par[x] = par[par[x]]; x = par[x]
+        return x
+    post = collections.defaultdict(list)
+    for t, v in T.items():
+        for w in v["tk"]: post[w].append(t)
+    for w, ts in post.items():
+        if len(ts) > 300: continue                                       # very common word: pairs are found through rarer words
+        for i, p in enumerate(ts):
+            for q in ts[i + 1:]:
+                if find(p) == find(q) or not (tc[p] & tc[q]): continue
+                A, B = T[p]["tk"], T[q]["tk"]; sh = len(A & B)
+                if sh / len(A | B) >= 0.75 or (sh >= 2 and sh == min(len(A), len(B))): par[find(p)] = find(q)
+    groups = collections.defaultdict(list)
+    for t in T: groups[find(t)].append(t)
+    db.execute("delete from projects"); db.execute("delete from project_threads")
+    for g in groups.values():
+        g.sort(key=lambda t: T[t]["r"]["first_ts"]); rs = [T[t]["r"] for t in g]
+        top = max(rs, key=lambda r: (r["n"], -r["first_ts"])); name = clean_subj(top["subj"])
+        if len({year_of(r["first_ts"]) for r in rs}) > 1: name = re.sub(r"\s{2,}", " ", re.sub(r"\b(19|20)\d\d\b", "", name)).strip(" -:") or name
+        why = sorted({w for t in g for w in T[t]["why"]})
+        pid = min(g); ppl = sorted(set().union(*[tc[t] for t in g]))
+        db.execute("insert into projects values(?,?,?,?,?,?,?,?)", (pid, name or "(no subject)", min(r["first_ts"] for r in rs), max(r["last_ts"] for r in rs), len(g), sum(r["n"] for r in rs), ";".join(ppl), ", ".join(why[:12])))
+        db.executemany("insert into project_threads values(?,?)", [(pid, t) for t in g])
+    db.commit(); stage(db, "projects", "done", f"{len(groups)} projects"); print(f"projects: {len(groups)} (from {len(T)} work threads)")
 
+# ---------------------------------------------------------------- STAGE 7: exports (CRM-ready CSVs)
+# ---------------------------------------------------------------- BOT TOOLS: bounces, decisions, show, search (offline; they read the SQLite only, never the mailbox)
+DECISIONS = ("keep", "junk", "unsure", "do-not-contact")
+ROLES = ("buyer", "past-client", "collaborator", "vendor", "personal", "service", "noise", "other")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-']+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+")
+STATUS_RE = re.compile(r"\b([45])\.\d{1,3}\.\d{1,3}\b")
+FINAL_RCPT = re.compile(r"(?:final|original)-recipient:\s*(?:rfc822;)?\s*<?([^\s<>;]+@[^\s<>;]+)", re.I)
+BOUNCE_WHY = re.compile(r"(user unknown|unknown user|does not exist|doesn'?t exist|no such (user|mailbox|recipient)|mailbox (unavailable|not found|full|disabled)|recipient (address )?rejected|address (not found|rejected)|invalid (recipient|address)|unable to deliver|couldn'?t be found|not found|over quota|quota exceeded|blocked|account (disabled|inactive)|domain (not found|does not exist)|host or domain name not found|unable to look up host|name or service not known|recipientnotfound|server unavailable|unable to receive mail|account that you tried to reach does not exist)", re.I)
+BOUNCE_PERM = re.compile(r"user unknown|unknown user|does not exist|doesn'?t exist|no such (user|mailbox|recipient)|address (not found|rejected)|couldn'?t be found|recipient (address )?rejected|recipientnotfound|invalid (recipient|address)|account (disabled|inactive)|domain (not found|does not exist)|host or domain name not found|unable to look up host|name or service not known", re.I)
+DSN_ORIGINAL = re.compile(r"^[ \t>]*(-{2,}.*(original|forwarded|message).*|original message.*|reporting-mta:.*|received:.*|return-path:.*|message-id:.*|content-type:.*|(from|to|cc|subject|date):.*)$", re.I | re.M)
+DSN_PREFIX = re.compile(r"^\s*(undeliverable|undelivered mail returned to sender|returned mail|mail delivery failed|failure notice|delivery (status notification|failure)[^:]*)\s*[:\-]\s*", re.I)
+def parse_ymd(v, end=False):
+    """'2019' | '2019-06' | '2019-06-01' -> epoch seconds (UTC) at the start of that period"""
+    if not v: return None
+    m = re.match(r"^(\d{4})(?:-(\d{1,2})(?:-(\d{1,2}))?)?$", str(v).strip())
+    if not m: raise SystemExit(f"bad date {v!r}: use YYYY or YYYY-MM-DD")
+    return int(dt.datetime(int(m.group(1)), int(m.group(2) or 1), int(m.group(3) or 1), tzinfo=dt.timezone.utc).timestamp())
+def open_ro(path):
+    """read-only SQLite connection for show/search/decisions: cannot change the database or take the writer lock"""
+    if not os.path.exists(path): raise SystemExit(f"no database at {path}; run the mining stages first")
+    db = sqlite3.connect(pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro", uri=True, timeout=60); db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=60000"); db.create_function("fold", 1, lambda x: (x or "").casefold(), deterministic=True); return db
+def has_table(db, t): return bool(db.execute("select 1 from sqlite_master where type='table' and name=?", (t,)).fetchone())
+def stamp(ts): return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(ts)) if ts else "undated"
+
+def build_bounces(db):
+    """Addresses David wrote to that bounced. Exact: the failed recipient named in the delivery-failure message body (fetch stores DSN bodies).
+    Fallback when no body was fetched: 'Undeliverable: <subject>' matched to David's own sent mail within 3 days. Rebuilt from the DB each call."""
+    selfs = set(json.loads(meta_get(db, "self", "[]"))); sent = collections.defaultdict(list)
+    for r in db.execute("select m.ts, m.subject, a.addr from messages m join addrs a on a.mid=m.id and a.role in ('to','cc') where m.is_sent=1 and m.decision='keep'"): sent[r["addr"]].append((r["ts"] or 0, r["subject"] or ""))
+    db.execute("delete from bounces"); n = 0
+    for m in db.execute("select m.id, m.ts, m.subject, b.text, b.sig, b.quoted from messages m left join bodies b on b.mid=m.id where m.dreason=?", (DSN_REASON,)).fetchall():
+        # the body splitter files the tail of a notice ("<addr>: host ... said: 550 5.1.1 ...", the usual Postfix/iCloud layout) as a signature: read all of it
+        text = "\n".join(x for x in (m["text"], m["sig"], m["quoted"]) if x); subj = m["subject"] or ""; found = []; how = "failure notice body"
+        found = [x.lower().strip(".,'") for x in FINAL_RCPT.findall(text)]
+        if not found: found = [x.lower().strip(".,'") for x in EMAIL_RE.findall(DSN_ORIGINAL.split(text, 1)[0][:3000])]      # explanation only, not the quoted original (its To:/Cc: lines name people who got the mail fine)
+        found = [x for x in dict.fromkeys(found) if x in sent and x not in selfs]
+        if not found:
+            allx = [x for x in dict.fromkeys(y.lower().strip(".,'") for y in EMAIL_RE.findall(text)) if x in sent and x not in selfs]
+            found = allx if len(allx) == 1 else []
+        orig = DSN_PREFIX.sub("", subj).strip() if DSN_PREFIX.match(subj) else ""
+        if not found and orig:
+            nk = norm_subject(orig); near = [(m["ts"] - ts, ad) for ad, l in sent.items() if ad not in selfs for ts, sj in l if norm_subject(sj) == nk and m["ts"] and 0 <= m["ts"] - ts <= 3 * 86400]
+            if near: best = min(d for d, _ in near); found = sorted({ad for d, ad in near if d == best}); how = "matched to David's sent mail by subject"
+        st = STATUS_RE.search(text); status = st.group(0) if st else ""
+        if not status:
+            mm = re.search(r"\b([45]\d\d)[ -]\d", text); status = mm.group(1) if mm else ""
+        soft = bool(re.search(r"delay|warning|temporar|will keep trying|still trying", subj, re.I)) or status.startswith("4") or status.startswith("5.7")   # 5.7.x = blocked for content/policy: the address itself works
+        hard = 0 if soft else (1 if status.startswith("5") or BOUNCE_PERM.search(text) or re.search(r"permanent|fail|undeliverable|returned to sender|unknown", subj + " " + text[:600], re.I) else None)
+        why = BOUNCE_WHY.search(text); reason = ""
+        if why:
+            line = next((l.strip() for l in text.splitlines() if why.group(0).lower() in l.lower()), why.group(0)); reason = line[:160]
+        elif text.strip(): reason = next((l.strip() for l in text.splitlines() if l.strip()), "")[:160]
+        for ad in found:
+            db.execute("insert or replace into bounces values(?,?,?,?,?,?,?,?)", (m["id"], ad, m["ts"], hard, status, reason, orig, how)); n += 1
+    db.commit(); return n
+def bounce_rows(db):
+    """one row per bounced address, newest bounce first, with the evidence the bot needs to decide whether the address is really dead"""
+    con = {r["addr"]: r for r in db.execute("select * from contacts")}; byname = collections.defaultdict(set)
+    for ad, r in con.items():
+        k = name_key(r["name"] or "")
+        if k and len((r["name"] or "").split()) >= 2: byname[k].add(ad)
+    out = []
+    for ad, in db.execute("select addr from bounces group by addr order by max(ts) desc").fetchall():
+        bs = db.execute("select * from bounces where addr=? order by ts desc", (ad,)).fetchall(); b = bs[0]
+        last_to = db.execute("select max(m.ts) from messages m join addrs a on a.mid=m.id and a.role in ('to','cc') where m.is_sent=1 and m.decision='keep' and a.addr=?", (ad,)).fetchone()[0]
+        last_from = db.execute("select max(ts) from messages where is_sent=0 and decision='keep' and from_addr=?", (ad,)).fetchone()[0]
+        heard_after = bool(last_from and b["ts"] and last_from > b["ts"]); kind = "hard" if any(x["hard"] == 1 for x in bs) else ("soft" if all(x["hard"] == 0 for x in bs) else "unknown")
+        c = con.get(ad); others = sorted(byname[name_key(c["name"] or "")] - {ad}) if c and name_key(c["name"] or "") in byname else []
+        if heard_after: step = "they wrote to David after the bounce, so the address may still work; check before treating it as dead"
+        elif kind == "soft": step = "temporary failure; retry later, no lookup needed unless it repeats"
+        else: step = "current-address lookup needed (do not use this address for outreach until then)"
+        out.append({"addr": ad, "name": c["name"] if c else "", "company": c["company"] if c else "", "ts": b["ts"], "n": len(bs), "kind": kind, "status": b["status"], "reason": b["reason"], "orig": b["orig_subject"], "how": b["how"],
+                    "last_to": last_to, "last_from": last_from, "heard_after": heard_after, "others": others, "step": step, "dead": kind != "soft" and not heard_after})
+    return out
+BOUNCE_COLS = ["Email", "Name", "Company", "Last bounce", "Bounces", "Kind", "Status code", "Reason", "Subject David had sent", "Found by", "Last time David wrote to them", "Last time they wrote to David", "Wrote after bounce", "Other addresses with the same name", "Next step"]
+def cmd_bounces(a):
+    db = opendb(a.db); n = build_bounces(db); rows = bounce_rows(db); os.makedirs(a.out, exist_ok=True)
+    write_csv(os.path.join(a.out, "bounces.csv"), [BOUNCE_COLS] + [[cell(x) for x in [r["addr"], r["name"], r["company"], ymd(r["ts"]), r["n"], r["kind"], r["status"], r["reason"], r["orig"], r["how"], ymd(r["last_to"]), ymd(r["last_from"]), "yes" if r["heard_after"] else "no", "; ".join(r["others"]), r["step"]]] for r in rows])
+    nb = db.execute("select count(*) from messages where dreason=?", (DSN_REASON,)).fetchone()[0]
+    print(f"bounces: {nb} delivery-failure messages -> {len(rows)} addresses David wrote to ({sum(r['dead'] for r in rows)} need a current-address lookup) -> {a.out}/bounces.csv")
+    for r in rows[:20]: print(f"  {r['addr']} | {r['kind']} {r['status']} | {ymd(r['ts'])} | {r['reason'][:70]}" + (" | same name also: " + ", ".join(r["others"]) if r["others"] else ""))
+
+def load_decisions(db):
+    """{'contact': {email: row}, 'domain': {domain: row}} from the decisions table (survives every re-run; filter/link never touch it)"""
+    out = {"contact": {}, "domain": {}}
+    if has_table(db, "decisions"):
+        for r in db.execute("select * from decisions"): out[r["kind"]][r["key"]] = r
+    return out
+def decision_for(dm, addr, domain): return dm["contact"].get(addr) or dm["domain"].get(domain)
+def dnc_file(out_dir):
+    """David's own do-not-contact list: out/do-not-contact.csv, one address or domain per line (optional note after a comma)"""
+    s = {"contact": set(), "domain": set()}; p = os.path.join(out_dir, "do-not-contact.csv")
+    if os.path.exists(p):
+        with open(p, encoding="utf-8-sig", newline="") as fh:
+            for r in csv.reader(fh):
+                k = (r[0] if r else "").strip().lower()
+                if not k or k.startswith("#") or k in ("email", "address", "domain", "email/domain"): continue
+                (s["contact"] if "@" in k else s["domain"]).add(k.lstrip("@"))
+    return s
+def is_dnc(dm, dnc, addr, domain):
+    d = decision_for(dm, addr, domain)
+    return addr in dnc["contact"] or domain in dnc["domain"] or bool(d and d["decision"] == "do-not-contact")
+def cmd_decide(a):
+    """record the bot's (or David's) triage decision for a contact or a whole domain; re-runs never erase it and export honors it"""
+    items = []
+    if a.from_csv:
+        with open(a.from_csv, encoding="utf-8-sig", newline="") as fh:
+            for r in csv.DictReader(fh):
+                r = {(k or "").strip().lower(): (v or "").strip() for k, v in r.items()}
+                items.append(("contact" if r.get("email") else "domain", (r.get("email") or r.get("domain") or "").lower(), r.get("decision", ""), r.get("role", ""), r.get("note", ""), r.get("evidence", "")))
+    for e in a.email or []: items.append(("contact", e.strip().lower(), a.decision or "", a.role or "", a.note or "", a.evidence or ""))
+    for d in a.domain or []: items.append(("domain", d.strip().lower().lstrip("@"), a.decision or "", a.role or "", a.note or "", a.evidence or ""))
+    if not items: raise SystemExit("decide: give --email ADDR and/or --domain DOMAIN (or --from-csv FILE with columns Email,Domain,Decision,Role,Note,Evidence)")
+    db = opendb(a.db); n = 0
+    for kind, key, dec, role, note, ev in items:
+        if not key or (kind == "contact" and "@" not in key): raise SystemExit(f"decide: bad key {key!r}")
+        if a.remove: db.execute("delete from decisions where kind=? and key=?", (kind, key)); n += 1; continue
+        if dec not in DECISIONS: raise SystemExit(f"decide: --decision must be one of {', '.join(DECISIONS)} (got {dec!r} for {key})")
+        if role and role not in ROLES: raise SystemExit(f"decide: --role must be one of {', '.join(ROLES)} (got {role!r} for {key})")
+        old = db.execute("select role, note, evidence from decisions where kind=? and key=?", (kind, key)).fetchone()
+        if old and not a.replace:                       # a later call that leaves a field out keeps what was recorded before
+            role, note, ev = role or old["role"], note or old["note"], ev or old["evidence"]
+        db.execute("insert or replace into decisions values(?,?,?,?,?,?,?)", (kind, key, dec, role, note, ev, int(time.time()))); n += 1
+    db.commit(); print(f"decide: {'removed' if a.remove else 'recorded'} {n} decision(s). Run `export` to write them into contacts.csv / crm-contacts.csv.")
+def sample_subjects(db, addr, k=4):
+    seen, out = set(), []
+    for r in db.execute("select t.subj from thread_contacts tc join threads t on t.id=tc.tid where tc.addr=? order by t.last_ts desc", (addr,)):
+        key = norm_subject(r[0])
+        if key and key not in seen: seen.add(key); out.append((r[0] or "")[:80])
+        if len(out) >= k: break
+    return out
+def cmd_decisions(a):
+    db = open_ro(a.db); dm = load_decisions(db); dnc = dnc_file(a.out)
+    if not a.pending:
+        print(f"{len(dm['contact'])} contact decisions, {len(dm['domain'])} domain decisions; do-not-contact file: {len(dnc['contact'])} addresses, {len(dnc['domain'])} domains")
+        for kind in ("domain", "contact"):
+            for key, r in sorted(dm[kind].items()): print(f"  {kind:7} {key} | {r['decision']} | {r['role'] or '-'} | {r['note'] or ''}")
+        return
+    lim = a.limit or 30; n = 0; tot = 0
+    for c in db.execute("select * from contacts where coalesce(kind,'person')='person' order by last_ts desc"):
+        if decision_for(dm, c["addr"], c["domain"]) or is_dnc(dm, dnc, c["addr"], c["domain"]): continue
+        tot += 1
+        if n >= lim: continue
+        n += 1; tw = "two-way" if c["n_from"] and c["n_to"] else ("they wrote only" if c["n_from"] else "David wrote only")
+        print(f"{c['addr']} | {c['name']} | {c['company']} | {c['title']} | last {ymd(c['last_ts'])} | {tw} ({c['n_from']} from / {c['n_to']} to) | {c['n_threads']} threads | " + "; ".join(sample_subjects(db, c["addr"], 3)))
+    print(f"-- {n} shown, {tot} contacts still without a decision (newest first). Record decisions with `decide`.")
+
+def show_message(db, m, a):
+    to = collections.defaultdict(list)
+    for r in db.execute("select role, addr, name from addrs where mid=?", (m["id"],)): to[r["role"]].append(f"{r['name']} <{r['addr']}>" if r["name"] else r["addr"])
+    who = "David" if m["is_sent"] else (f"{m['from_name']} <{m['from_addr']}>" if m["from_name"] else m["from_addr"])
+    atts = [x.get("name") or "?" for x in json.loads(m["att"] or "[]")] if m["has_att"] else []
+    few = lambda l, k=10: ", ".join(l[:k]) + (f" (+{len(l) - k} more)" if len(l) > k else "")   # mass mail: keep the header line readable
+    print(f"--- message {m['id']} | {stamp(m['ts'])} | from {who} | to {few(to['to']) or '-'}" + (f" | cc {few(to['cc'])}" if to["cc"] else "") + (f" | attachments: {', '.join(atts)}" if atts else ""))
+    if m["subject"]: print(f"    subject: {m['subject']}")
+    b = db.execute("select text, quoted, sig, trunc from bodies where mid=?", (m["id"],)).fetchone()
+    if not b: print(f"    (no body stored: decision={m['decision']}, folder={m['folder']}; re-run `fetch` if the folder is deep)"); return
+    t = (b["text"] or "").strip(); cap = a.chars if a.chars is not None else 1500
+    if cap and len(t) > cap: t = t[:cap].rstrip() + f"\n    […{len(b['text']) - cap:,} more characters; use --chars 0 for all]"
+    print("\n".join("    " + l for l in (t or "(empty body)").splitlines()))
+    if a.sig and b["sig"]: print("    [signature]\n" + "\n".join("    " + l for l in b["sig"].strip().splitlines()))
+    if a.quoted and b["quoted"]: print("    [quoted history]\n" + "\n".join("    > " + l for l in b["quoted"].strip().splitlines()))
+    if b["trunc"]: print("    [body was cut at the fetch size cap]")
+def cmd_show(a):
+    """plain-text view of stored mail for the bot: one thread, one message, a project, or everything with a contact / a company domain"""
+    db = open_ro(a.db); lim = a.limit or 40; lo, hi = parse_ymd(a.since), parse_ymd(a.before); tids = []; label = ""
+    if a.message:
+        m = db.execute("select * from messages where id=?", (a.message,)).fetchone()
+        if not m: raise SystemExit(f"no message {a.message}")
+        show_message(db, m, a); return
+    if a.thread: tids = [int(a.thread)]; label = f"thread {a.thread}"
+    elif a.project:
+        tids = [r[0] for r in db.execute("select tid from project_threads where pid=? order by tid", (a.project,))]; p = db.execute("select * from projects where id=?", (a.project,)).fetchone()
+        if not p: raise SystemExit(f"no project {a.project}")
+        label = f"project {p['id']}: {p['name']} ({ymd(p['first_ts'])} to {ymd(p['last_ts'])}; contacts: {p['contacts']}; why: {p['why']})"
+    elif a.email or a.domain:
+        addrs = [e.lower() for e in (a.email or [])]
+        for d in a.domain or []: addrs += [r[0] for r in db.execute("select addr from contacts where domain=?", (d.lower().lstrip("@"),))]
+        if not addrs: raise SystemExit("no contacts for that domain; try `search` instead")
+        dm = load_decisions(db); dnc = dnc_file(a.out)
+        for ad in dict.fromkeys(addrs):
+            c = db.execute("select * from contacts where addr=?", (ad,)).fetchone()
+            if c:
+                d = decision_for(dm, ad, c["domain"]); st = "do-not-contact" if is_dnc(dm, dnc, ad, c["domain"]) else (d["decision"] if d else "undecided")
+                print(f"CONTACT {c['name']} <{ad}> | {c['title'] or 'no title'} at {c['company'] or '?'} | {c['phone'] or 'no phone'} | {ymd(c['first_ts'])} to {ymd(c['last_ts'])} | {c['n_from']} from them / {c['n_to']} to them | {c['n_threads']} threads | triage: {st}" + (f" ({d['role']}; {d['note']})" if d and (d["role"] or d["note"]) else ""))
+                for s in db.execute("select ts, title, company, phone from sigs where addr=? order by ts desc limit 3", (ad,)): print(f"    signature {ymd(s['ts'])}: {s['title'] or '-'} | {s['company'] or '-'} | {s['phone'] or '-'}")
+            else: print(f"CONTACT <{ad}> is not in contacts (never linked)")
+        tids = [r[0] for r in db.execute(f"select distinct tid from thread_contacts where addr in ({','.join('?' * len(addrs))}) order by tid", addrs)]; label = "threads with " + ", ".join(dict.fromkeys(addrs))
+    else: raise SystemExit("show: give --thread ID, --message ID, --project ID, --email ADDR, or --domain DOMAIN")
+    th = []
+    for t in tids:
+        r = db.execute("select t.*, (select pid from project_threads where tid=t.id) pid from threads t where t.id=?", (t,)).fetchone()
+        if r and (not lo or (r["last_ts"] or 0) >= lo) and (not hi or (r["first_ts"] or 0) < hi): th.append(r)
+    th.sort(key=lambda r: r["first_ts"] or 0, reverse=bool(a.newest))
+    print(f"== {label}: {len(th)} thread(s)" + (f" between {a.since or 'start'} and {a.before or 'now'}" if lo or hi else ""))
+    for r in th: print(f"   thread {r['id']} | {ymd(r['first_ts'])} to {ymd(r['last_ts'])} | {r['n']} msgs | {r['subj']}" + (f" | project {r['pid']}" if r["pid"] else ""))
+    if a.list: return
+    left = lim
+    for r in th:
+        ms = db.execute("select * from messages where thread=? order by ts, id", (r["id"],)).fetchall()
+        ms = [m for m in ms if (not lo or (m["ts"] or 0) >= lo) and (not hi or (m["ts"] or 0) < hi)]
+        if left <= 0: break
+        print(f"\n=== thread {r['id']}: {r['subj']} ({ymd(r['first_ts'])} to {ymd(r['last_ts'])}, {r['n']} messages)")
+        for m in ms[:left]: show_message(db, m, a)
+        left -= min(left, len(ms))
+    shown = lim - left; total = sum(r["n"] for r in th)
+    if shown < total: print(f"\n[{total - shown} more message(s) not shown (limit {lim}); narrow with --thread/--since/--before or raise --limit]")
+def cmd_search(a):
+    """case-insensitive AND-search over stored subjects, bodies and signatures; prints message id + thread id so `show` can open the thread"""
+    terms = [t.casefold() for t in a.terms if t.strip()]
+    if not terms: raise SystemExit("search: give one or more terms (all must match), e.g.  search \"creative advertising\" paramount")
+    db = open_ro(a.db); lim = a.limit or 25; lo, hi = parse_ymd(a.since), parse_ymd(a.before); fld = a.field or "all"
+    hay = {"subject": "fold(coalesce(m.subject,''))", "body": "fold(coalesce(b.text,'') || char(10) || coalesce(b.sig,''))", "all": "fold(coalesce(m.subject,'') || char(10) || coalesce(b.text,'') || char(10) || coalesce(b.sig,''))"}[fld]
+    where = ["m.decision != 'dup'" if a.include_noise else "m.decision = 'keep'"]; par = []
+    for t in terms: where.append(f"instr({hay}, ?) > 0"); par.append(t)
+    if lo: where.append("m.ts >= ?"); par.append(lo)
+    if hi: where.append("m.ts < ?"); par.append(hi)
+    for e in a.email or []: where.append("(m.from_addr=? or exists(select 1 from addrs x where x.mid=m.id and x.addr=?))"); par += [e.lower(), e.lower()]
+    for d in a.domain or []: where.append("(m.from_addr like ? or exists(select 1 from addrs x where x.mid=m.id and x.addr like ?))"); par += ["%@" + d.lower().lstrip("@")] * 2
+    q = f"select m.id, m.thread, m.ts, m.is_sent, m.from_addr, m.from_name, m.subject, m.decision, b.text, b.sig from messages m left join bodies b on b.mid=m.id where {' and '.join(where)} order by m.ts desc"
+    n = 0
+    for r in db.execute(q, par):
+        n += 1
+        if n > lim: continue
+        body = (r["text"] or "") + "\n" + (r["sig"] or ""); low = body.casefold(); pos = next((low.find(t) for t in terms if low.find(t) >= 0), -1)
+        snip = re.sub(r"\s+", " ", body[max(0, pos - 90):pos + 140]).strip() if pos >= 0 else ""
+        who = "David" if r["is_sent"] else (r["from_name"] or r["from_addr"])
+        print(f"msg {r['id']} | thread {r['thread'] if r['thread'] is not None else '-'} | {ymd(r['ts'])} | {who} <{r['from_addr']}> | {r['subject']}" + ("" if r["decision"] == "keep" else f" | [{r['decision']}]") + (f"\n    …{snip}…" if snip else ""))
+    print(f"-- {min(n, lim)} of {n} matching message(s) shown. Open one with: show --thread ID  (or --message ID)")
+
+VOICE_JUNK = re.compile(r"^\s*(sent from my \w+|get outlook for \w+|>.*)\s*$", re.I)
 def cmd_voice(a):
-    """Learn David's voice from his own sent mail (bodies already fetched). Writes voice-notes.md"""
-    db = opendb(a.db); os.makedirs(a.out, exist_ok=True)
-    rows = db.execute("select m.subject,m.ts,b.text,b.sig from messages m join bodies b on b.mid=m.id where m.is_sent=1 and m.decision='keep' and length(b.text)>0 order by m.ts").fetchall()
-    seen, notes = set(), []
-    for r in rows:
-        t = r["text"].strip(); w = len(t.split()); k = re.sub(r"\W+", " ", t.lower())[:80]
-        if 12 <= w <= 140 and k not in seen and "$" not in t and not re.search(r"invoice|quote|estimate|attached|tracking|crate|schedule|dimension|pickup|\\d+x\\d+", t, re.I): seen.add(k); notes.append((r, t, w))
-    if not notes: print("voice: no short personal sent notes found yet"); return
-    greet, close, tri = collections.Counter(), collections.Counter(), collections.Counter(); exc = contr = 0; words = []
-    for r, t, w in notes:
-        words.append(w); fl = t.split("\n")[0].strip()
-        if len(fl.split()) <= 6: greet[re.sub(r"\b[A-Z][a-z]+\b(?=[,!.-]*$)", "<Name>", fl)] += 1
-        sg = (r["sig"] or "").split("\n")[0].strip()
-        if sg and len(sg) < 30: close[sg] += 1
-        exc += t.count("!"); contr += len(re.findall(r"\w+'(s|re|ll|ve|d|t|m)\b", t))
-        ws = re.findall(r"[a-z']+", t.lower()); tri.update(" ".join(ws[i:i + 3]) for i in range(len(ws) - 2))
-    n = len(notes); pick = sorted(notes, key=lambda x: (-(x[1].count("!") + 0), x[2]))[:0]
-    sample = [x for x in notes if 15 <= x[2] <= 90][-25:]
-    md = ["# David's voice notes (from his sent mail)", "", f"Based on {n} short non-transactional notes of {len(rows)} sent messages with bodies.", "",
-          f"- Typical length: median {sorted(words)[n // 2]} words (range {min(words)}-{max(words)}). Keep reconnect notes at or under that.", f"- Exclamation marks per note: {exc / n:.2f}; contractions per note: {contr / n:.2f}",
-          "- Common openings: " + (", ".join(f"`{g}` ×{c}" for g, c in greet.most_common(6)) or "n/a"), "- Common sign-offs: " + (", ".join(f"`{g}` ×{c}" for g, c in close.most_common(6)) or "n/a"),
-          "- Recurring phrases: " + ", ".join(f"\"{g}\"" for g, c in tri.most_common(40) if c >= 3 and not re.match(r"(the|and|to|of|in|a|i) ", g))[:400], "", "## Samples (real notes; mimic rhythm and warmth, never copy)", ""]
-    for r, t, w in sample: md.append(f"**{ymd(r['ts'])} - {r['subject'][:60]}**\n> " + t.replace("\n", "\n> ") + "\n")
-    open(os.path.join(a.out, "voice-notes.md"), "w").write("\n".join(md)); print(f"voice: {n} notes analysed -> {a.out}/voice-notes.md")
+    """N of David's own sent messages, his new text only (no quoted history, no signature), spread across the years, so the bot can match how he writes"""
+    db = open_ro(a.db); lim = a.limit or 10; lo, hi = parse_ymd(a.since), parse_ymd(a.before); cap = a.chars if a.chars is not None else 2000
+    q = ("select m.id, m.ts, m.thread, m.subject, b.text from messages m join bodies b on b.mid=m.id where m.is_sent=1 and m.decision='keep'"
+         + (" and m.ts >= ?" if lo else "") + (" and m.ts < ?" if hi else "") + " order by m.ts")
+    cands, seen_t, seen_b = [], set(), set()
+    for r in db.execute(q, [x for x in (lo, hi) if x]):
+        if re.match(r"\s*(fwd?|fw)\s*:", r["subject"] or "", re.I): continue                 # forwards are someone else's words
+        t = "\n".join(l for l in (r["text"] or "").splitlines() if not VOICE_JUNK.match(l)).strip()
+        key = re.sub(r"[\W\d_]+", " ", t.lower())[:200]                                       # template mails that differ only in figures/dates count once
+        if len(t.split()) < 12 or key in seen_b or (r["thread"] is not None and r["thread"] in seen_t): continue   # one per conversation, no near-duplicates, no one-liners
+        seen_b.add(key); seen_t.add(r["thread"]); cands.append((r, t))
+    if a.newest: pick = cands[-lim:][::-1]
+    elif lim >= len(cands): pick = cands
+    else: pick = [cands[i] for i in sorted({round(i * (len(cands) - 1) / max(1, lim - 1)) for i in range(lim)})]   # evenly spread over time, each message once
+    print(f"== voice: {len(pick)} of {len(cands)} usable sent messages (David's own new text; quoted history and signatures removed)")
+    for r, t in pick:
+        words = len(t.split())
+        if cap and len(t) > cap: t = t[:cap].rstrip() + f" […{len(t) - cap:,} more characters]"
+        print(f"\n--- sent {ymd(r['ts'])} | message {r['id']} | {words} words")
+        print(t)
+def cell(x, cap=1000):
+    """CSV cells stay readable for the bot: one line, capped length"""
+    if x is None: return ""
+    if isinstance(x, float) and x.is_integer(): x = int(x)
+    t = re.sub(r"\s+", " ", str(x)).strip()
+    return t if len(t) <= cap else t[:cap - 1] + "…"
+CONTACT_COLS = ["Name", "Email", "Company", "Title", "Phone", "Domain", "Name source", "First contact", "Last contact", "Messages from them", "Messages to them", "Threads", "Projects",
+                "Two-way", "Sample subjects", "Attachment types", "Same name, other addresses", "Decision", "Role", "Triage note", "Outreach status", "Buys from David (threads)", "Sells to David (threads)"]
+COMPANY_COLS = ["Company", "Domain", "Contacts", "Shared inboxes", "Threads", "First contact", "Last contact", "People", "Decision", "Role", "Triage note"]
+DECISION_COLS = ["Kind", "Key", "Decision", "Role", "Note", "Evidence", "Decided at"]
+THREAD_COLS = ["Thread ID", "Subject", "First date", "Last date", "Messages", "Messages from David", "Contacts", "Attachments", "Project ID", "Who is buying", "Buying evidence"]
+PROJECT_COLS = ["Project ID", "Project", "First date", "Last date", "Years", "Threads", "Messages", "Contacts", "Companies", "Thread IDs", "Why included"]
+def cmd_export(a):
+    db = opendb(a.db); stage(db, "export", "running"); os.makedirs(a.out, exist_ok=True)
+    W = lambda name, hdr, rows: write_csv(os.path.join(a.out, name), [hdr] + [[cell(x) for x in r] for r in rows])
+    proj = {r["id"]: r for r in db.execute("select * from projects")}; t2p = {r[1]: r[0] for r in db.execute("select pid, tid from project_threads")}
+    con = {r["addr"]: r for r in db.execute("select * from contacts")}
+    c_proj = collections.defaultdict(set)
+    for r in db.execute("select tid, addr from thread_contacts"):
+        if r[0] in t2p: c_proj[r[1]].add(t2p[r[0]])
+    allc = sorted(con.values(), key=lambda r: -(r["last_ts"] or 0)); rows = [r for r in allc if (r["kind"] or "person") == "person"]
+    t_lab, c_trade = trade_views(db)
+    dm = load_decisions(db); dnc = dnc_file(a.out); build_bounces(db); br = bounce_rows(db); dead = {b["addr"] for b in br if b["dead"]}
+    subj_of = collections.defaultdict(list)
+    for r in db.execute("select tc.addr, t.subj from thread_contacts tc join threads t on t.id=tc.tid order by t.last_ts desc"): subj_of[r[0]].append(r[1] or "")
+    att_t = collections.defaultdict(collections.Counter)
+    for r in db.execute("select thread, att from messages where has_att=1 and decision='keep' and thread is not null"):
+        for x in json.loads(r["att"] or "[]"): att_t[r["thread"]][(os.path.splitext(x.get("name") or "")[1].lower().lstrip(".") or "none")] += 1
+    att_c = collections.defaultdict(collections.Counter)
+    for r in db.execute("select tid, addr from thread_contacts"): att_c[r[1]].update(att_t.get(r[0], {}))
+    byname = collections.defaultdict(set)
+    for r in allc:
+        if (r["kind"] or "person") == "person" and len((r["name"] or "").split()) >= 2 and name_key(r["name"]): byname[name_key(r["name"])].add(r["addr"])
+    def subjects(ad, k=4):
+        seen, out = set(), []
+        for s_ in subj_of.get(ad, []):
+            key = norm_subject(s_)
+            if key and key not in seen: seen.add(key); out.append(s_[:80])
+            if len(out) >= k: break
+        return " | ".join(out)
+    def triage(r):
+        d = decision_for(dm, r["addr"], r["domain"]); dn = is_dnc(dm, dnc, r["addr"], r["domain"])
+        return (d["decision"] if d else "", d["role"] if d else "", d["note"] if d else "", "do-not-contact" if dn else ("bounced: find current address" if r["addr"] in dead else "ok"))
+    def crow(r):
+        tw = "two-way" if r["n_from"] and r["n_to"] else ("they wrote only" if r["n_from"] else "David wrote only"); k = name_key(r["name"] or "")
+        return [r["name"], r["addr"], r["company"], r["title"], r["phone"], r["domain"], r["name_src"], ymd(r["first_ts"]), ymd(r["last_ts"]), r["n_from"], r["n_to"], r["n_threads"],
+                "; ".join(proj[p]["name"] for p in sorted(c_proj[r["addr"]], key=lambda p: -proj[p]["last_ts"])[:10]), tw, subjects(r["addr"]),
+                "; ".join(f"{e} x{n}" for e, n in att_c[r["addr"]].most_common(6)), "; ".join(sorted(byname.get(k, set()) - {r["addr"]})[:5]) if k else ""] + list(triage(r)) + list(c_trade.get(r["addr"], (0, 0)))
+    W("contacts.csv", CONTACT_COLS, [crow(r) for r in rows])
+    if dm["contact"] or dm["domain"]: W("crm-contacts.csv", CONTACT_COLS, [crow(r) for r in rows if (decision_for(dm, r["addr"], r["domain"]) or {"decision": ""})["decision"] == "keep"])
+    elif os.path.exists(os.path.join(a.out, "crm-contacts.csv")): os.remove(os.path.join(a.out, "crm-contacts.csv"))
+    W("bounces.csv", BOUNCE_COLS, [[r["addr"], r["name"], r["company"], ymd(r["ts"]), r["n"], r["kind"], r["status"], r["reason"], r["orig"], r["how"], ymd(r["last_to"]), ymd(r["last_from"]), "yes" if r["heard_after"] else "no", "; ".join(r["others"]), r["step"]] for r in br])
+    W("decisions.csv", DECISION_COLS, [[kind, key, d["decision"], d["role"], d["note"], d["evidence"], stamp(d["ts"])] for kind in ("domain", "contact") for key, d in sorted(dm[kind].items())])
+    co = {}
+    for r in allc:
+        key = r["domain"] if r["domain"] not in FREE else ("co:" + re.sub(r"[^a-z0-9]", "", r["company"].lower()) if r["company"] else "")
+        if not key or key == "co:": continue
+        e = co.setdefault(key, {"names": collections.Counter(), "dom": r["domain"] if r["domain"] not in FREE else "", "ppl": 0, "shared": [], "thr": set(), "first": r["first_ts"], "last": r["last_ts"], "who": []})
+        if r["company"]: e["names"][r["company"]] += 1
+        if (r["kind"] or "person") == "person": e["ppl"] += 1; e["who"].append(f"{r['name'] or r['addr']}" + (f" ({r['title']})" if r["title"] else ""))
+        else: e["shared"].append(r["addr"])
+        e["first"] = min(x for x in (e["first"], r["first_ts"]) if x) if (e["first"] or r["first_ts"]) else None; e["last"] = max(e["last"] or 0, r["last_ts"] or 0)
+    for r in db.execute("select tid, addr from thread_contacts"):
+        c = con.get(r[1])
+        if c:
+            k = c["domain"] if c["domain"] not in FREE else ("co:" + re.sub(r"[^a-z0-9]", "", c["company"].lower()) if c["company"] else "")
+            if k in co: co[k]["thr"].add(r[0])
+    def cdec(e):
+        d = dm["domain"].get(e["dom"]) if e["dom"] else None
+        return [d["decision"], d["role"], d["note"]] if d else ["", "", ""]
+    W("companies.csv", COMPANY_COLS, [[e["names"].most_common(1)[0][0] if e["names"] else org_label(e["dom"]), e["dom"], e["ppl"], "; ".join(sorted(e["shared"])[:10]), len(e["thr"]), ymd(e["first"]), ymd(e["last"]), "; ".join(e["who"][:8])] + cdec(e) for e in sorted(co.values(), key=lambda e: (-e["ppl"], -(e["last"] or 0)))])
+    tc = collections.defaultdict(list)
+    for r in db.execute("select tid, addr from thread_contacts order by addr"): tc[r[0]].append(r[1])
+    trows = []
+    for r in db.execute("select t.id, t.subj, t.first_ts, t.last_ts, t.n, sum(m.is_sent) sent, sum(m.has_att) att from threads t join messages m on m.thread=t.id group by t.id order by t.last_ts desc"):
+        if r["id"] in tc: trows.append([r["id"], r["subj"], ymd(r["first_ts"]), ymd(r["last_ts"]), r["n"], r["sent"], "; ".join(tc[r["id"]][:30]), r["att"], t2p.get(r["id"], "")] + list(t_lab.get(r["id"], ("", ""))))
+    W("threads.csv", THREAD_COLS, trows)
+    p_thr = collections.defaultdict(list)
+    for r in db.execute("select pid, tid from project_threads order by tid"): p_thr[r[0]].append(r[1])
+    prow = []
+    for p in sorted(proj.values(), key=lambda p: -p["last_ts"]):
+        ppl = [x for x in (p["contacts"] or "").split(";") if x]
+        cos = sorted({con[x]["company"] for x in ppl if x in con and con[x]["company"]})
+        yrs = sorted({year_of(p["first_ts"]), year_of(p["last_ts"])}); prow.append([p["id"], p["name"], ymd(p["first_ts"]), ymd(p["last_ts"]), "-".join(map(str, yrs)) if len(yrs) > 1 else yrs[0], p["n_threads"], p["n_msgs"], "; ".join(ppl[:30]), "; ".join(cos[:15]), " ".join(map(str, p_thr[p["id"]][:50])), p["why"]])
+    W("projects.csv", PROJECT_COLS, prow)
+    n_msg = db.execute("select count(*) from messages").fetchone()[0]; dec = dict(db.execute("select decision, count(*) from messages group by decision").fetchall())
+    yrs = collections.Counter(year_of(r["last_ts"]) for r in rows if r["last_ts"])
+    md = [f"# Mining summary ({utcnow()})", "", "Extraction only: contacts, the threads they are in, and the projects those threads form. No scoring or labels.", "",
+          f"- Messages read (headers): {n_msg:,}; kept: {dec.get('keep', 0):,}; junk/automated: {dec.get('noise', 0):,}; duplicates: {dec.get('dup', 0):,}",
+          f"- Contacts (unique addresses of people): {len(rows):,}; shared company inboxes David wrote to (listed in companies.csv): {len(allc) - len(rows):,}; with a full name: {sum(1 for r in rows if is_full_name(r['name'] or '')):,}; name from signature: {sum(1 for r in rows if r['name_src'] == 'signature'):,}",
+          f"- Threads with contacts: {len(trows):,}; projects: {len(prow):,} (covering {len(t2p):,} threads)", f"- Companies: {len(co):,}",
+          f"- Bounced addresses David wrote to: {len(br):,} ({len(dead):,} need a current-address lookup); decisions recorded: {len(dm['contact']) + len(dm['domain']):,}; do-not-contact: {sum(1 for r in rows if is_dnc(dm, dnc, r['addr'], r['domain'])):,}", "",
+          "## Contacts by year of last contact", ""] + [f"- {y}: {n:,}" for y, n in sorted(yrs.items())] + ["", "## Files", "",
+          "- contacts.csv: one row per unique email address", "- companies.csv: company domains (and signature company names for personal addresses)",
+          "- threads.csv: every conversation with at least one contact; Project ID when it belongs to a project", "- projects.csv: groups of work threads; `Why included` lists the words/files that qualified it",
+          "- bounces.csv: addresses David wrote to that bounced (needs a current-address lookup), with evidence", "- decisions.csv / crm-contacts.csv: the bot's recorded triage decisions, and the contacts decided `keep` (only once decisions exist)",
+          f"- {os.path.basename(a.db)}: SQLite with all headers, kept bodies, threads, contacts and projects (tables: messages, addrs, bodies, sigs, threads, contacts, thread_contacts, projects, project_threads)"]
+    write_text(os.path.join(a.out, "summary.md"), "\n".join(md) + "\n")
+    stage(db, "export", "done"); print(f"export: contacts {len(rows)}, companies {len(co)}, threads {len(trows)}, projects {len(prow)} -> {a.out}/ (summary.md first)")
 
 def cmd_status(a):
-    db = opendb(a.db)
-    print("survey:", meta_get(db, "survey_done"), "approved:", meta_get(db, "survey_approved") or "NO")
-    for r in db.execute("select display,total,done,last_uid,is_sent from folders order by display"): print(f"  {r[0]:35} {r[2]}/{r[1]} last_uid={r[3]}{' [sent]' if r[4] else ''}")
-    for t in ("messages", "bodies", "threads", "people", "orgs", "tclass"): print(f"  {t}: {db.execute(f'select count(*) from {t}').fetchone()[0]}")
+    if not os.path.exists(a.db): print(f"no database at {a.db} yet: start with `survey`"); return
+    db = opendb(a.db); who = lock_holder(a.db)
+    print("dcrmine", VERSION, "| now", utcnow(), "| running:", who or "no (safe to start or re-run any stage)")
+    print("survey:", meta_get(db, "survey_done") or "not run", "| approved:", meta_get(db, "survey_approved") or "NO")
+    cur = meta_get(db, "stage:current")
+    if cur: print("last stage event:", cur)
+    for st in ("survey", "crawl", "filter", "fetch", "thread", "link", "projects", "export"):
+        v = meta_get(db, "stage:" + st)
+        if v: print(f"  {st:9} {v}")
+    print("folders (stored/matching):")
+    for r in db.execute("select display,total,done,last_uid,is_sent,updated,crit from folders order by display"):
+        print(f"  {r[0][:40]:40} {r[2] or 0}/{r[1] or 0}" + (" [sent]" if r[4] else "") + (f" [{r[6]}]" if r[6] and r[6] != "ALL" else "") + (f" updated {time.strftime('%Y-%m-%dT%H:%MZ', time.gmtime(r[5]))}" if r[5] else ""))
+    sk = db.execute("select count(*), sum(tries>=?) from crawl_skips", (MAX_SKIP_TRIES,)).fetchone()
+    if sk[0]: print(f"  messages the server would not return: {sk[0]} ({sk[1] or 0} given up after {MAX_SKIP_TRIES} tries)")
+    for t in ("messages", "bodies", "threads", "projects"): print(f"  {t}: {db.execute(f'select count(*) from {t}').fetchone()[0]}")
+    n_people = db.execute("select count(*) from contacts where coalesce(kind,'person')='person'").fetchone()[0]; print(f"  contacts (people): {n_people}")
+    left = len(body_candidates(db)) if meta_get(db, "stage:filter") else 0
+    if left: print(f"  bodies still to fetch: {left}")
+def cmd_seen_audit(a):
+    """Read-only proof that mining did not mark mail read: snapshot UID SEARCH UNSEEN per folder, compare with the earlier snapshot."""
+    c = Conn(a); path = os.path.join(a.out, "seen-audit.json"); os.makedirs(a.out, exist_ok=True)
+    snap = {"taken": utcnow(), "folders": {}}
+    for f in list_folders(c):
+        try: c.select(f["name"])
+        except (ValueError, imaplib.IMAP4.error): continue
+        snap["folders"][f["name"]] = {"uidvalidity": c.uv.get(f["name"], 0), "unseen": c.search("UNSEEN"), "messages": c.status_counts(f["name"], "(MESSAGES)").get("MESSAGES")}
+    if not os.path.exists(path) or a.force:
+        write_text(path, json.dumps(snap)); n = sum(len(v["unseen"]) for v in snap["folders"].values())
+        print(f"seen-audit: baseline saved ({n} unread messages in {len(snap['folders'])} folders). Run mining, then `seen-audit` again to compare."); return
+    with open(path, encoding="utf-8") as fh: old = json.load(fh)
+    changed = 0; lines = []
+    for nm, v in old["folders"].items():
+        nw = snap["folders"].get(nm)
+        if not nw or nw["uidvalidity"] != v["uidvalidity"]: lines.append(f"  {utf7d(nm)}: not comparable (folder gone or renumbered)"); continue
+        became_read = sorted(set(v["unseen"]) - set(nw["unseen"])); changed += len(became_read)
+        lines.append(f"  {utf7d(nm)}: unread {len(v['unseen'])} -> {len(nw['unseen'])}; previously-unread now read: {len(became_read)}" + (f" (UIDs {became_read[:10]})" if became_read else ""))
+    print(f"seen-audit vs baseline {old['taken']}:"); print("\n".join(lines))
+    print("RESULT: no message changed from unread to read" if not changed else f"RESULT: {changed} message(s) changed unread -> read since the baseline (if the owner read mail meanwhile this is expected; dcrmine only uses EXAMINE + BODY.PEEK)")
 def cmd_run(a):
-    for fn in (cmd_crawl, cmd_filter, cmd_fetch, cmd_thread, cmd_link, cmd_classify, cmd_export, cmd_voice): fn(a)
-
+    for fn in (cmd_crawl, cmd_filter, cmd_fetch, cmd_thread, cmd_link, cmd_projects, cmd_export): fn(a)
+    print("run complete: read summary.md first")
 def build_parser():
     p = argparse.ArgumentParser(prog="dcrmine", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("cmd", choices=["survey", "approve-survey", "crawl", "filter", "fetch", "thread", "link", "classify", "export", "voice", "run", "status"])
+    p.add_argument("cmd", choices=["survey", "approve-survey", "crawl", "filter", "fetch", "thread", "link", "projects", "export", "run", "status", "seen-audit", "bounces", "decide", "decisions", "show", "search", "voice"])
     p.add_argument("--db", default="dcr_mail.sqlite"); p.add_argument("--out", default="mining-out", help="work dir: survey + exports")
     p.add_argument("--host", default="imap.mail.me.com"); p.add_argument("--port", type=int, default=993); p.add_argument("--plain", action="store_true", help="no TLS (test fixture only)")
     p.add_argument("--user", default=os.environ.get("DCR_IMAP_USER")); p.add_argument("--pass-env", default="ICLOUD_APP_PASSWORD"); p.add_argument("--timeout", type=int, default=90)
@@ -1334,11 +1739,27 @@ def build_parser():
     p.add_argument("--sample", type=int, default=25, help="survey: headers per folder-year"); p.add_argument("--sent-sample", type=int, default=400, help="survey: headers per Sent folder-year")
     p.add_argument("--seeds"); p.add_argument("--keywords"); p.add_argument("--no-text-search", action="store_true")
     p.add_argument("--include-skipped", action="store_true"); p.add_argument("--body-batch", type=int, default=50); p.add_argument("--max-body", type=int, default=60000)
-    p.add_argument("--backend", default="auto", choices=["auto", "heuristic", "scaledown", "openai"]); p.add_argument("--min-score", type=int, default=3); p.add_argument("--all", action="store_true")
-    p.add_argument("--max-threads", type=int, default=10 ** 9); p.add_argument("--llm-batch", type=int, default=20); p.add_argument("--force", action="store_true")
-    p.add_argument("--clients"); p.add_argument("--min-msgs", type=int, default=2); p.add_argument("--max-pipeline", type=int, default=300)
+    p.add_argument("--force", action="store_true", help="seen-audit: replace the saved baseline")
+    p.add_argument("--since", help="crawl: only messages dated on/after YYYY or YYYY-MM-DD (bounded first run)"); p.add_argument("--before", help="crawl: only messages dated before YYYY or YYYY-MM-DD")
+    p.add_argument("--limit", type=int, help="crawl: at most N new messages per folder this run (newest first); show/search/decisions/voice: how many items to print")
+    p.add_argument("terms", nargs="*", help="search: words that must all appear")
+    p.add_argument("--thread"); p.add_argument("--project"); p.add_argument("--message"); p.add_argument("--email", action="append"); p.add_argument("--domain", action="append")
+    p.add_argument("--chars", type=int, help="show/voice: max characters of each message body (default 1500 / 2000; 0 = all)"); p.add_argument("--quoted", action="store_true", help="show: also print quoted history")
+    p.add_argument("--sig", action="store_true", help="show: also print signatures"); p.add_argument("--list", action="store_true", help="show: only list the threads"); p.add_argument("--ids", help="fetch: comma-separated message ids whose text to download now, even if the filter dropped them (see `search --include-noise`)"); p.add_argument("--newest", action="store_true", help="show: newest thread first (default oldest first); voice: newest messages instead of a spread over the years")
+    p.add_argument("--field", choices=["all", "subject", "body"], help="search: where to look (default all)"); p.add_argument("--include-noise", action="store_true", help="search: also look at messages the filter dropped as noise")
+    p.add_argument("--decision", help="decide: " + "|".join(DECISIONS)); p.add_argument("--role", help="decide: " + "|".join(ROLES)); p.add_argument("--note"); p.add_argument("--evidence")
+    p.add_argument("--from-csv", dest="from_csv", help="decide: CSV with columns Email,Domain,Decision,Role,Note,Evidence"); p.add_argument("--remove", action="store_true", help="decide: delete the decision")
+    p.add_argument("--replace", action="store_true", help="decide: overwrite role/note/evidence even when left blank"); p.add_argument("--pending", action="store_true", help="decisions: list contacts that have no decision yet")
+    p.add_argument("--version", action="version", version="dcrmine " + VERSION)
     return p
+READ_ONLY_CMDS = {"status", "show", "search", "decisions", "decide", "voice"}   # no run lock: never touch the mailbox; decide only writes one small table (SQLite busy-timeout covers a running job)
 def main(argv=None):
     a = build_parser().parse_args(argv)
-    return {"survey": cmd_survey, "approve-survey": cmd_approve, "crawl": cmd_crawl, "filter": cmd_filter, "fetch": cmd_fetch, "thread": cmd_thread, "link": cmd_link, "classify": cmd_classify, "export": cmd_export, "voice": cmd_voice, "run": cmd_run, "status": cmd_status}[a.cmd](a)
+    fn = {"survey": cmd_survey, "approve-survey": cmd_approve, "crawl": cmd_crawl, "filter": cmd_filter, "fetch": cmd_fetch, "thread": cmd_thread, "link": cmd_link, "projects": cmd_projects,
+          "export": cmd_export, "run": cmd_run, "status": cmd_status, "seen-audit": cmd_seen_audit, "bounces": cmd_bounces, "decide": cmd_decide,
+          "decisions": cmd_decisions, "show": cmd_show, "search": cmd_search, "voice": cmd_voice}[a.cmd]
+    if a.cmd in READ_ONLY_CMDS or a.cmd == "seen-audit": return fn(a)
+    with RunLock(a.db):
+        try: return fn(a)
+        except KeyboardInterrupt: raise SystemExit("interrupted; progress is saved - re-run the same command to resume")
 if __name__ == "__main__": main()
