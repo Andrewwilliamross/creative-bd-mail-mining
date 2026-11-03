@@ -89,10 +89,12 @@ $M show --domain company.com --list             # which threads exist for a comp
 $M show --project 4                             # every thread in a project
 $M search "creative advertising" paramount      # all terms must match; subject, body, signature
 $M decisions --pending --limit 30               # next batch of contacts nobody has decided on
+$M voice --limit 10                             # 10 of David's own sent messages, spread over the years: match his style when drafting
 $M decide --email a@b.com --decision keep --role buyer --evidence "thread 38: hired David for the NOBL set"
 $M decide --domain vendor.com --decision junk --role vendor
 $M export                                       # writes the decisions into contacts.csv, crm-contacts.csv, decisions.csv
 ```
+In `contacts.csv`, `Buys from David (threads)` and `Sells to David (threads)` tell clients from vendors: they count threads where David sent or was asked for a quote, estimate, bid or invoice (buyer), or where David asked for or received one (vendor). `threads.csv` → `Who is buying` / `Buying evidence` shows the messages behind it; open them with `show --message ID`. Use it as evidence for `--role`, not as the decision.
 If `show` says `no body stored` for a message you need (the filter dropped it, or its folder is headers-only), download just that message: `$M fetch --ids 123,124` (read-only BODY.PEEK), then `show --message 123`.
 Decisions live in the database, so every re-run (`filter`, `link`, `export`) keeps them. David's do-not-contact list goes in `out/do-not-contact.csv` (one address or domain per line). Nothing here sends, edits or marks mail.
 

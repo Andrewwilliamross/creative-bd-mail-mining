@@ -2,7 +2,7 @@
 import ast, os, py_compile, shutil, subprocess, sys, tempfile, unittest
 from helpers import ENV, ROOT
 
-STDLIB_39 = set("argparse ast base64 codecs collections contextlib csv datetime email fcntl hashlib html http imaplib io json os quopri re shutil socket sqlite3 ssl "
+STDLIB_39 = set("argparse ast base64 codecs collections contextlib csv datetime email fcntl hashlib html http imaplib io json os pathlib quopri re shutil socket sqlite3 ssl "
                 "subprocess sys tempfile threading time unicodedata".split())
 COMMANDS = ["survey", "approve-survey", "crawl", "filter", "fetch", "thread", "link", "projects", "export", "run", "status", "seen-audit"]
 

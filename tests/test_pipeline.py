@@ -3,9 +3,9 @@ import csv, json, os, re, shutil, unittest
 from helpers import ENV, ROOT, Workdir, read_only_violations
 
 CONTACTS = ["Name", "Email", "Company", "Title", "Phone", "Domain", "Name source", "First contact", "Last contact", "Messages from them", "Messages to them", "Threads", "Projects",
-            "Two-way", "Sample subjects", "Attachment types", "Same name, other addresses", "Decision", "Role", "Triage note", "Outreach status"]
+            "Two-way", "Sample subjects", "Attachment types", "Same name, other addresses", "Decision", "Role", "Triage note", "Outreach status", "Buys from David (threads)", "Sells to David (threads)"]
 COMPANIES = ["Company", "Domain", "Contacts", "Shared inboxes", "Threads", "First contact", "Last contact", "People", "Decision", "Role", "Triage note"]
-THREADS = ["Thread ID", "Subject", "First date", "Last date", "Messages", "Messages from David", "Contacts", "Attachments", "Project ID"]
+THREADS = ["Thread ID", "Subject", "First date", "Last date", "Messages", "Messages from David", "Contacts", "Attachments", "Project ID", "Who is buying", "Buying evidence"]
 PROJECTS = ["Project ID", "Project", "First date", "Last date", "Years", "Threads", "Messages", "Contacts", "Companies", "Thread IDs", "Why included"]
 OUTPUTS = ["survey-report.md", "mining-plan.json", "summary.md", "contacts.csv", "companies.csv", "threads.csv", "projects.csv", "bounces.csv", "decisions.csv"]
 
@@ -106,7 +106,7 @@ class Pipeline(unittest.TestCase):
         txt = self.w.sql("select b.text, m.subject, m.from_name from bodies b join messages m on m.id=b.mid where m.from_addr='rene@pariscreative.example' and m.ts < 946684800")[0]
         self.assertIn("décor du café", txt[0]); self.assertEqual(txt[1], "Devis décor - café set"); self.assertEqual(txt[2], "René Dupont")
         subj = self.w.sql("select subject from messages where from_addr='ko@studioko.example'")[0][0]
-        self.assertNotIn("=?", subj)
+        self.assertNotIn("=?", subj); self.assertEqual(subj, "Café set quote")                 # unknown RFC 2047 charset decoded, not U+FFFD
 
     # ---------------- threading
     def test_threads(self):

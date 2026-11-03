@@ -72,6 +72,73 @@ class Tools(unittest.TestCase):
             self.assertEqual(rs["slow@later.example"]["kind"], "soft"); self.assertFalse(rs["slow@later.example"]["dead"])
             db.close()
 
+    def test_bounce_formats_icloud_gmail_outlook(self):
+        self.assertTrue(dcrmine.is_dsn("mailer-daemon@ms45.icloud.com", "Undelivered Mail Returned to Sender"))                        # iCloud (Postfix)
+        self.assertTrue(dcrmine.is_dsn("mailer-daemon@googlemail.com", "Delivery Status Notification (Failure)"))                      # Gmail
+        self.assertTrue(dcrmine.is_dsn("postmaster@outlook.com", "Undeliverable: Set build"))                                         # Outlook.com
+        self.assertTrue(dcrmine.is_dsn("microsoftexchange329e71ec88ae4615bbc36ab6ce41109e@agency.example", "Undeliverable: Set build"))  # Exchange / Office 365
+        self.assertFalse(dcrmine.is_dsn("tom@reyesmetalworks.example", "Undeliverable: Set build")); self.assertFalse(dcrmine.is_dsn("postmaster@x.example", "Welcome"))
+        with tempfile.TemporaryDirectory() as d:
+            db = dcrmine.opendb(os.path.join(d, "t.sqlite")); dcrmine.meta_set(db, "self", json.dumps(["me@mac.com"]))
+            def msg(i, ts, subj, sent, frm, to, decision="keep", reason=None):
+                db.execute("insert into messages(id,folder,uid,subject,ts,from_addr,is_sent,decision,dreason) values(?,?,?,?,?,?,?,?,?)", (i, "F", i, subj, ts, frm, sent, decision, reason))
+                for ad in to: db.execute("insert into addrs values(?,?,?,?)", (i, "to", ad, ""))
+            for i, ad in enumerate(("icloud@gone.example", "gmail@gone.example", "outlook@gone.example", "blocked@fine.example", "nodns@deaddomain.example"), 1): msg(i, 1000 + i, "Hello", 1, "me@mac.com", [ad])
+            R = dcrmine.DSN_REASON
+            # iCloud/Postfix: the failed address and code sit after a blank line, so the body splitter files them as the 'signature'
+            msg(11, 2000, "Undelivered Mail Returned to Sender", 0, "mailer-daemon@icloud.com", ["me@mac.com"], "noise", R)
+            db.execute("insert into bodies values(11,?,?,?,0)", ("This is a system-generated message to inform you that your email could not\nbe delivered to one or more recipients. Details of the email and the error are as follows:", "",
+                                                                  "<icloud@gone.example>: host mx.gone.example[192.0.2.1] said: 550 5.1.1\n    <icloud@gone.example>: Recipient address rejected: User unknown"))
+            msg(12, 2001, "Delivery Status Notification (Failure)", 0, "mailer-daemon@googlemail.com", ["me@mac.com"], "noise", R)           # Gmail: no status code in the text part
+            db.execute("insert into bodies values(12,?,?,?,0)", ("** Address not found **\n\nYour message wasn't delivered to gmail@gone.example because the address couldn't be found, or is unable to receive mail.\n\nThe response was:", "",
+                                                                  "The email account that you tried to reach does not exist."))
+            msg(13, 2002, "Undeliverable: Hello", 0, "postmaster@outlook.com", ["me@mac.com"], "noise", R)
+            db.execute("insert into bodies values(13,?,?,?,0)", ("Your message to outlook@gone.example couldn't be delivered.\noutlook wasn't found at gone.example.\n\nDiagnostic information for administrators:\nRemote Server returned '550 5.1.10 RESOLVER.ADR.RecipientNotFound; Recipient not found by SMTP address lookup'", "", ""))
+            msg(14, 2003, "Undelivered Mail Returned to Sender", 0, "mailer-daemon@icloud.com", ["me@mac.com"], "noise", R)
+            db.execute("insert into bodies values(14,?,?,?,0)", ("Details of the email and the error are as follows:", "", "<blocked@fine.example>: host mx.fine.example said: 552-5.7.0 This message was blocked because its content presents a potential security issue."))
+            msg(15, 2004, "Undelivered Mail Returned to Sender", 0, "mailer-daemon@icloud.com", ["me@mac.com"], "noise", R)
+            db.execute("insert into bodies values(15,?,?,?,0)", ("Details of the email and the error are as follows:", "", "<nodns@deaddomain.example>: unable to look up host deaddomain.example: Name or service not known"))
+            db.commit(); self.assertEqual(dcrmine.build_bounces(db), 5); rs = {r["addr"]: r for r in dcrmine.bounce_rows(db)}
+            self.assertEqual((rs["icloud@gone.example"]["kind"], rs["icloud@gone.example"]["status"]), ("hard", "5.1.1")); self.assertIn("User unknown", rs["icloud@gone.example"]["reason"])
+            self.assertEqual(rs["gmail@gone.example"]["kind"], "hard"); self.assertEqual((rs["outlook@gone.example"]["kind"], rs["outlook@gone.example"]["status"]), ("hard", "5.1.10"))
+            self.assertEqual(rs["blocked@fine.example"]["kind"], "soft"); self.assertFalse(rs["blocked@fine.example"]["dead"])               # content block: the address works
+            self.assertEqual(rs["nodns@deaddomain.example"]["kind"], "hard"); self.assertTrue(all(rs[a]["dead"] for a in ("icloud@gone.example", "gmail@gone.example", "outlook@gone.example")))
+            db.close()
+
+    # ---------------- who is buying
+    def test_who_is_buying_in_threads_and_contacts(self):
+        th = {}
+        for r in rows(self.w.path("threads.csv")): th.setdefault(r["Subject"], r)
+        self.assertEqual(th["Rookie of the Year trophy 2024"]["Who is buying"], "they buy from David")
+        self.assertRegex(th["Rookie of the Year trophy 2024"]["Buying evidence"], r"David sent quote.*David sent invoice")
+        self.assertEqual(th["ROY trophy base fabrication quote 2024"]["Who is buying"], "David buys from them")
+        self.assertIn("tom@reyesmetalworks.example sent quote", th["ROY trophy base fabrication quote 2024"]["Buying evidence"])
+        self.assertEqual(th["Quote request: 40 trade show booth backdrops"]["Who is buying"], "they buy from David")      # a request to David makes them the buyer
+        self.assertEqual(th["Prop rental quote for the showroom"]["Who is buying"], "David buys from them")              # David asking makes them the vendor
+        self.assertEqual(th["Happy holidays"]["Who is buying"] if "Happy holidays" in th else "", "")
+        c = self.contacts()
+        self.assertEqual((c["maria.lopez@pepsi-demo.example"]["Buys from David (threads)"], c["maria.lopez@pepsi-demo.example"]["Sells to David (threads)"]), ("7", "0"))
+        self.assertEqual(c["tom@reyesmetalworks.example"]["Buys from David (threads)"], "0"); self.assertGreaterEqual(int(c["tom@reyesmetalworks.example"]["Sells to David (threads)"]), 7)
+        self.assertEqual(c["kwells@wellsscenic.example"]["Sells to David (threads)"], "1"); self.assertEqual(c["charlie.ward@paramount-demo.example"]["Sells to David (threads)"], "0")
+        self.assertEqual(c["paul@grantevents.example"]["Buys from David (threads)"], "0")                               # no price talk: no signal
+        self.assertEqual(self.w.sql("select count(*) from trade where actor='david' and act='sells'")[0][0] > 0, True)   # queryable later
+
+    # ---------------- voice
+    def test_voice_prints_davids_own_words_only(self):
+        before = self.sha(); n = len(self.w.server.commands())
+        out = self.w.mine("voice", "--limit", "50", "--chars", "0").stdout
+        self.assertIn("usable sent messages", out); blocks = out.split("\n--- sent ")[1:]; self.assertGreater(len(blocks), 5)
+        for b in blocks: self.assertNotIn("wrote:", b); self.assertFalse(any(l.startswith(">") for l in b.splitlines()))   # no quoted history
+        self.assertNotIn("Senior Manager, Brand Experiences", out); self.assertNotIn("Charge Artist", out)                 # nobody else's words or signatures
+        self.assertEqual(sum("Rough quote for the trophy" in b for b in blocks), 1)                                     # yearly template mail counted once
+        ids = [int(x) for x in __import__("re").findall(r"\| message (\d+) \|", out)]
+        self.assertEqual({r[0] for r in self.w.sql(f"select is_sent from messages where id in ({','.join(map(str, ids))})")}, {1})
+        three = self.w.mine("voice", "--limit", "3").stdout; self.assertEqual(three.count("--- sent "), 3)
+        dates = __import__("re").findall(r"--- sent (\d{4})", three); self.assertEqual(dates, sorted(dates)); self.assertGreater(int(dates[-1]) - int(dates[0]), 5)   # spread over the years
+        new = __import__("re").findall(r"--- sent (\S+)", self.w.mine("voice", "--newest", "--limit", "2").stdout); self.assertEqual(new, sorted(new, reverse=True))
+        self.assertIn("more characters", self.w.mine("voice", "--limit", "2", "--chars", "20").stdout)
+        self.assertEqual(self.sha(), before); self.assertEqual(len(self.w.server.commands()), n)                        # read-only, never touches the mailbox
+
     # ---------------- show
     def test_show_thread_in_order_and_truncates(self):
         before = self.sha()
@@ -104,7 +171,16 @@ class Tools(unittest.TestCase):
         r = self.w.mine("fetch", "--ids", str(mid)); self.assertIn("fetch complete", r.stdout)
         self.assertNotIn("no body stored", self.w.mine("show", "--message", str(mid)).stdout)
         self.assertEqual(self.w.mine("fetch", "--ids", "99999999").returncode, 0)
+        und = self.w.sql("select id from messages where decision='noise' and dreason!='delivery failure notice' and id not in (select mid from bodies) order by id desc limit 1")[0][0]
+        db = sqlite3.connect(self.w.db); db.execute("update messages set decision=null where id=?", (und,)); db.commit(); db.close()   # not yet filtered (NULL decision)
+        self.w.mine("fetch", "--ids", str(und)); self.assertNotIn("no body stored", self.w.mine("show", "--message", str(und)).stdout)
+        self.w.mine("filter")
         self.assertEqual(read_only_violations(self.w.server.commands()), [])
+
+    def test_show_caps_long_recipient_lists(self):
+        mid = self.w.sql("select id from messages where subject='Holiday party photos'")[0][0]
+        head = self.w.mine("show", "--message", str(mid)).stdout.splitlines()[0]
+        self.assertIn("(+5 more)", head); self.assertEqual(head.count("@partyguests.example"), 9)     # 15 recipients -> first 10 shown (David + 9 guests)
 
     def test_show_says_when_no_body_is_stored(self):
         mid = self.w.sql("select id from messages where decision='noise' and dreason!='delivery failure notice' order by id limit 1")[0][0]

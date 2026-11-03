@@ -13,6 +13,16 @@ class HeaderDecoding(unittest.TestCase):
         for v in ("=?x-unknown?Q?caf=E9?= ok", "=?unknown-8bit?Q?caf=E9?= ok"):
             out = D.dh(v)
             self.assertNotIn("=?", out, v); self.assertIn("caf", out); self.assertTrue(out.endswith("ok"))
+            self.assertEqual(out, "café ok", v)                                                   # decoded, never U+FFFD
+
+    def test_rfc2047_unknown_charsets_decode_gracefully(self):
+        cases = {"=?unknown-8bit?q?Caf=E9?= set quote": "Café set quote",                       # what the email package writes for an undeclared 8-bit word
+                 "=?x-unknown?B?Q2Fm6Q==?=": "Café", "=?bogus-charset?Q?cr=E8me?=": "crème",         # unknown name: utf-8, then windows-1252
+                 "=?x-user-defined?Q?na=EFve?=": "naïve", "=?bogus?B?Q2Fmw6k=?=": "Café",           # utf-8 bytes under an unknown name
+                 "=?utf-8?Q?Caf=C3=A9?= and =?x-unknown?Q?cr=E8me?=": "Café and crème",               # mixed words keep their spacing
+                 "=?gb2312?B?xOO6ww==?=": "你好", "=?iso-8859-1?q?J=FCrgen?= <j@x.example>": "Jürgen <j@x.example>"}
+        for v, want in cases.items(): self.assertEqual(D.dh(v), want, v)
+        self.assertNotIn("\ufffd", D.parse_headers(b"Subject: =?unknown-8bit?q?Caf=E9?= set quote\r\nFrom: a@b.example\r\n\r\n")["subject"])
 
     def test_folded_and_multiline_headers_become_one_line(self):
         self.assertEqual(D.dh("Hello\r\n  world"), "Hello world")
@@ -203,6 +213,19 @@ class Bodies(unittest.TestCase):
             self.assertFalse(D.is_automated(a), a)
         for a in ("info@shop.example", "hello@brand.example", "rsvp@museum.example", "reservations@hotel.example", "studio@dcr.example"): self.assertTrue(D.is_shared_inbox(a), a)
         for a in ("maria@pepsi.example", "infante@x.example", "helen@x.example"): self.assertFalse(D.is_shared_inbox(a), a)
+
+    def test_who_is_buying_cues(self):
+        offer = lambda t, atts=(): D.trade_acts(t, list(atts))
+        for t, want in (("Rough quote for the trophy including fabrication, base and crate is $5,200 with a 50% deposit.", ("quote", "")),
+                        ("Our bid is $9,500. Includes design and build.", ("bid", "")), ("Invoice attached for the balance, $2,600, net 30.", ("invoice", "")),
+                        ("A reminder that invoice 1188 for $6,200 is past due.", ("invoice", "")), ("Here is the estimate for the build.", ("estimate", "")),
+                        ("Tom, can you quote the cast metal base again?", ("", "quote")), ("Quote please.", ("", "quote")), ("Need seating and signage. Quote?", ("", "quote")),
+                        ("We would like a quote for the showroom set build.", ("", "quote")), ("Please send the invoice, we'll pay net 30.", ("", "invoice")),
+                        ("Please bid. We have a budget of $18,500.", ("", "bid")), ("I'm disputing this invoice.", ("", "")), ("See you at the shoot!", ("", ""))):
+            self.assertEqual(offer(t), want, t)
+        self.assertEqual(offer("Thanks, see attached.", ["Invoice_ROY_2024.pdf"]), ("invoice", ""))
+        self.assertEqual(offer("Paint numbers attached.", ["paint_quote.pdf"]), ("quote", ""))
+        self.assertEqual(offer("Photos attached.", ["install1.jpg", "bidet.png"]), ("", ""))       # 'bid' inside a word is not a bid
 
     def test_signature_footer_is_not_a_company(self):
         for junk in ("Pronouns: [he/him]", "Privacy Policy", "Clinical Professor", "Co-Founder", "This email is confidential"): self.assertEqual(D.clean_org(junk), "", junk)
